@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "AxisAlliesAI",
+	"Description": "",
+	"Category": "Other",
+	"CreatedBy": "Kevin Jansen",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "AxisAlliesAI",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

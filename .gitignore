@@ -1,0 +1,22 @@
+# Unreal Engine Folders to Ignore
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Built data and crash reports
+BuiltDataStorage/
+CrashReportClient/
+
+# Visual Studio / Rider files
+.vs/
+*.sln
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS generated files
+.DS_Store
+Thumbs.db
