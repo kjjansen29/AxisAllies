@@ -1,13 +1,178 @@
 ﻿#include "UAI_ReplayBufferManager.h"
 
 // ----------------------------------------------------------------
-// Static helper: GetStagingPath
+// GetStagingPath — uses CurrentStagingSessionName
 // ----------------------------------------------------------------
-static FString GetStagingPath()
+FString UAI_ReplayBufferManager::GetStagingPath() const
 {
     return FPaths::Combine(
         FPaths::ProjectSavedDir(),
-        TEXT("AITraining/StagingBuffer.json"));
+        TEXT("AITraining/Staging"),
+        FString::Printf(TEXT("%s.json"), *CurrentStagingSessionName));
+}
+
+// ----------------------------------------------------------------
+// GetStagingDirectory
+// ----------------------------------------------------------------
+FString UAI_ReplayBufferManager::GetStagingDirectory() const
+{
+    return FPaths::Combine(
+        FPaths::ProjectSavedDir(),
+        TEXT("AITraining/Staging"));
+}
+
+// ----------------------------------------------------------------
+// GetStagingFileNames
+// Returns all staging file names without extension
+// ----------------------------------------------------------------
+TArray<FString> UAI_ReplayBufferManager::GetStagingFileNames() const
+{
+    TArray<FString> FileNames;
+    const FString Dir = GetStagingDirectory();
+
+    TArray<FString> FoundFiles;
+    IFileManager::Get().FindFiles(FoundFiles, *(Dir / TEXT("*.json")), true, false);
+
+    for (const FString& File : FoundFiles)
+        FileNames.Add(FPaths::GetBaseFilename(File));
+
+    return FileNames;
+}
+
+// ----------------------------------------------------------------
+// SetStagingSessionName
+// Sets session name without loading existing staging file
+// ----------------------------------------------------------------
+void UAI_ReplayBufferManager::SetStagingSessionName(const FString& SessionName)
+{
+    CurrentStagingSessionName = SessionName.IsEmpty()
+        ? TEXT("Default") : SessionName;
+}
+
+// ----------------------------------------------------------------
+// LoadStagingSession
+// Sets session name and confirms staging file exists
+// ----------------------------------------------------------------
+bool UAI_ReplayBufferManager::LoadStagingSession(const FString& SessionName)
+{
+    SetStagingSessionName(SessionName);
+    return FPaths::FileExists(GetStagingPath());
+}
+
+// ----------------------------------------------------------------
+// DeleteStagingFile
+// Deletes the staging file for the given session name
+// ----------------------------------------------------------------
+bool UAI_ReplayBufferManager::DeleteStagingFile(const FString& SessionName)
+{
+    const FString Path = FPaths::Combine(
+        GetStagingDirectory(),
+        FString::Printf(TEXT("%s.json"), *SessionName));
+
+    if (!FPaths::FileExists(Path))
+        return false;
+
+    return IFileManager::Get().Delete(*Path);
+}
+
+void UAI_ReplayBufferManager::SaveTrainingMetadata(int32 EpisodeId) const
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetNumberField(TEXT("new_samples_since_last_training"), NewSamplesSinceLastTraining);
+    Obj->SetNumberField(TEXT("current_episode_id"), EpisodeId);
+    Obj->SetStringField(TEXT("current_staging_session_name"), CurrentStagingSessionName);
+
+    FString Output;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+    FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+
+    const FString Path = GetTrainingMetadataPath();
+    const FString Dir = FPaths::GetPath(Path);
+    if (!Dir.IsEmpty())
+        IFileManager::Get().MakeDirectory(*Dir, true);
+
+    FFileHelper::SaveStringToFile(Output, *Path);
+}
+
+void UAI_ReplayBufferManager::SaveTrainingMetadata() const
+{
+    int32 ExistingEpisodeId = 0;
+    const FString Path = GetTrainingMetadataPath();
+    FString FileData;
+    if (FFileHelper::LoadFileToString(FileData, *Path))
+    {
+        TSharedPtr<FJsonObject> Obj;
+        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileData);
+        if (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid())
+        {
+            int32 Loaded = 0;
+            if (Obj->TryGetNumberField(TEXT("current_episode_id"), Loaded))
+                ExistingEpisodeId = FMath::Max(0, Loaded);
+        }
+    }
+
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetNumberField(TEXT("new_samples_since_last_training"), NewSamplesSinceLastTraining);
+    Obj->SetNumberField(TEXT("current_episode_id"), ExistingEpisodeId);
+    Obj->SetStringField(TEXT("current_staging_session_name"), CurrentStagingSessionName);
+
+    FString Output;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+    FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+
+    const FString Dir = FPaths::GetPath(Path);
+    if (!Dir.IsEmpty())
+        IFileManager::Get().MakeDirectory(*Dir, true);
+
+    FFileHelper::SaveStringToFile(Output, *Path);
+}
+
+void UAI_ReplayBufferManager::LoadTrainingMetadata(int32& OutEpisodeId)
+{
+    const FString Path = GetTrainingMetadataPath();
+
+    FString FileData;
+    if (!FFileHelper::LoadFileToString(FileData, *Path))
+    {
+        NewSamplesSinceLastTraining = 0;
+        OutEpisodeId = 0;
+        CurrentStagingSessionName = TEXT("Default");
+        return;
+    }
+
+    TSharedPtr<FJsonObject> Obj;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileData);
+
+    if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+    {
+        NewSamplesSinceLastTraining = 0;
+        OutEpisodeId = 0;
+        CurrentStagingSessionName = TEXT("Default");
+        return;
+    }
+
+    int32 Loaded = 0;
+    if (Obj->TryGetNumberField(TEXT("new_samples_since_last_training"), Loaded))
+        NewSamplesSinceLastTraining = FMath::Max(0, Loaded);
+
+    int32 LoadedEpisodeId = 0;
+    if (Obj->TryGetNumberField(TEXT("current_episode_id"), LoadedEpisodeId))
+        OutEpisodeId = FMath::Max(0, LoadedEpisodeId);
+    else
+        OutEpisodeId = 0;
+
+    FString LoadedSessionName;
+    if (Obj->TryGetStringField(TEXT("current_staging_session_name"), LoadedSessionName))
+        CurrentStagingSessionName = LoadedSessionName.IsEmpty()
+        ? TEXT("Default") : LoadedSessionName;
+    else
+        CurrentStagingSessionName = TEXT("Default");
+}
+
+void UAI_ReplayBufferManager::LoadTrainingMetadata()
+{
+    int32 UnusedEpisodeId = 0;
+    LoadTrainingMetadata(UnusedEpisodeId);
 }
 
 // ----------------------------------------------------------------
@@ -138,66 +303,92 @@ void UAI_ReplayBufferManager::DeserializeSample(
                     continue;
 
                 FUnitEntity Entity;
+
+                // [0]  UnitType / 13
                 Entity.UnitType =
                     FMath::RoundToInt((*FeatArr)[0]->AsNumber() * 13.0f);
+                // [1]  (OwningPlayer+1) / 12
                 Entity.OwningPlayer =
                     FMath::RoundToInt((*FeatArr)[1]->AsNumber() * 12.0f) - 1;
+                // [2]  min(Count,20) / 20
                 Entity.Count =
                     FMath::RoundToInt((*FeatArr)[2]->AsNumber() * 20.0f);
+                // [3]  HitPoints / 2
                 Entity.HitPoints =
                     FMath::RoundToInt((*FeatArr)[3]->AsNumber() * 2.0f);
+                // [4]  min(MovementRemaining,8) / 8
                 Entity.MovementRemaining =
                     FMath::RoundToInt((*FeatArr)[4]->AsNumber() * 8.0f);
+                // [5]  SlotId / 20
                 Entity.SlotId =
                     FMath::RoundToInt((*FeatArr)[5]->AsNumber() * 20.0f);
+                // [6]  bIsScrambled
                 Entity.bIsScrambled =
                     (*FeatArr)[6]->AsNumber() > 0.5f;
+                // [7]  bHasLoadedThisTurn
                 Entity.bHasLoadedThisTurn =
                     (*FeatArr)[7]->AsNumber() > 0.5f;
+                // [8]  bHasUnloadedThisTurn
                 Entity.bHasUnloadedThisTurn =
                     (*FeatArr)[8]->AsNumber() > 0.5f;
+                // [9]  bIsSubmerged
                 Entity.bIsSubmerged =
                     (*FeatArr)[9]->AsNumber() > 0.5f;
+                // [10] CombatEngagementState / 2
                 Entity.CombatEngagementState =
                     FMath::RoundToInt((*FeatArr)[10]->AsNumber() * 2.0f);
+                // [11] bIsRetreating
                 Entity.bIsRetreating =
                     (*FeatArr)[11]->AsNumber() > 0.5f;
+                // [12] (CargoUnitTypeA+1)/14; 0 if empty
                 {
                     const float Raw = (float)(*FeatArr)[12]->AsNumber();
                     Entity.CargoUnitTypeA = Raw > 1e-5f
                         ? FMath::RoundToInt(Raw * 14.0f) - 1 : -1;
                 }
+                // [13] (CargoUnitOwnerA+1)/12; 0 if empty
                 {
                     const float Raw = (float)(*FeatArr)[13]->AsNumber();
                     Entity.CargoUnitOwnerA = Raw > 1e-5f
                         ? FMath::RoundToInt(Raw * 12.0f) - 1 : -1;
                 }
+                // [14] (CargoUnitTypeB+1)/14; 0 if empty
                 {
                     const float Raw = (float)(*FeatArr)[14]->AsNumber();
                     Entity.CargoUnitTypeB = Raw > 1e-5f
                         ? FMath::RoundToInt(Raw * 14.0f) - 1 : -1;
                 }
+                // [15] (CargoUnitOwnerB+1)/12; 0 if empty
                 {
                     const float Raw = (float)(*FeatArr)[15]->AsNumber();
                     Entity.CargoUnitOwnerB = Raw > 1e-5f
                         ? FMath::RoundToInt(Raw * 12.0f) - 1 : -1;
                 }
+                // [16] bIsStrategicBombing
                 Entity.bIsStrategicBombing =
                     (*FeatArr)[16]->AsNumber() > 0.5f;
+                // [17] bIsEscorting
                 Entity.bIsEscorting =
                     (*FeatArr)[17]->AsNumber() > 0.5f;
+                // [18] bIsIntercepting
                 Entity.bIsIntercepting =
                     (*FeatArr)[18]->AsNumber() > 0.5f;
+                // [19] bIsConductingSurpriseStrike
                 Entity.bIsConductingSurpriseStrike =
                     (*FeatArr)[19]->AsNumber() > 0.5f;
+                // [20] IsBombarding / 329
                 Entity.IsBombarding =
                     FMath::RoundToInt((*FeatArr)[20]->AsNumber() * 329.0f);
+                // [21] bHasCompletedSurpriseStrike
                 Entity.bHasCompletedSurpriseStrike =
                     (*FeatArr)[21]->AsNumber() > 0.5f;
+                // [22] bHasCompletedBombardment
                 Entity.bHasCompletedBombardment =
                     (*FeatArr)[22]->AsNumber() > 0.5f;
+                // [23] bIsParatrooper
                 Entity.bIsParatrooper =
                     (*FeatArr)[23]->AsNumber() > 0.5f;
+                // [24] StartOfTurnTerritory / 328
                 Entity.StartOfTurnTerritory =
                     FMath::RoundToInt((*FeatArr)[24]->AsNumber() * 328.0f);
 
@@ -252,6 +443,12 @@ TArray<FMCTSTrainingSample> UAI_ReplayBufferManager::LoadTotalBufferFromDisk() c
     return TotalBuffer;
 }
 
+// Clear samples in memory without saving
+void UAI_ReplayBufferManager::ClearBuffer()
+{
+    Buffer.Empty();
+}
+
 // ----------------------------------------------------------------
 // Instance method: SerializeToDisk
 // Writes TotalBuffer to disk grouped by PhaseId.
@@ -278,31 +475,15 @@ bool UAI_ReplayBufferManager::SerializeToDisk(
             if (!IsValidTrainingSample(*Sample))
                 continue;
 
-            TArray<TSharedPtr<FJsonValue>> NodeJson;
-            NodeJson.Reserve(Sample->NodeFeatures.Num());
-            for (float V : Sample->NodeFeatures)
-                NodeJson.Add(MakeShared<FJsonValueNumber>(V));
-
-            TArray<TSharedPtr<FJsonValue>> GlobalJson;
-            GlobalJson.Reserve(Sample->GlobalFeatures.Num());
-            for (float V : Sample->GlobalFeatures)
-                GlobalJson.Add(MakeShared<FJsonValueNumber>(V));
-
-            TArray<TSharedPtr<FJsonValue>> PolicyJson;
-            PolicyJson.Reserve(Sample->PolicyTarget.Num());
-            for (float V : Sample->PolicyTarget)
-                PolicyJson.Add(MakeShared<FJsonValueNumber>(V));
-
-            TArray<TSharedPtr<FJsonValue>> ValueJson;
-            ValueJson.Reserve(Sample->ValueTarget.Num());
-            for (float V : Sample->ValueTarget)
-                ValueJson.Add(MakeShared<FJsonValueNumber>(V));
-
             TSharedPtr<FJsonObject> SObj = MakeShared<FJsonObject>();
-            SObj->SetArrayField(TEXT("node_features"), NodeJson);
-            SObj->SetArrayField(TEXT("global_features"), GlobalJson);
-            SObj->SetArrayField(TEXT("policy_target"), PolicyJson);
-            SObj->SetArrayField(TEXT("value_target"), ValueJson);
+            SObj->SetArrayField(TEXT("node_features"),
+                FloatArrayToJson(Sample->NodeFeatures));
+            SObj->SetArrayField(TEXT("global_features"),
+                FloatArrayToJson(Sample->GlobalFeatures));
+            SObj->SetArrayField(TEXT("policy_target"),
+                FloatArrayToJson(Sample->PolicyTarget));
+            SObj->SetArrayField(TEXT("value_target"),
+                FloatArrayToJson(Sample->ValueTarget));
             SObj->SetNumberField(TEXT("phase_id"), Sample->PhaseId);
             SObj->SetNumberField(TEXT("player_id"), Sample->PlayerId);
             SerializeEntityList(*Sample, SObj);
@@ -370,6 +551,24 @@ int32 UAI_ReplayBufferManager::GetSamplesOnDisk() const
     return Count;
 }
 
+int32 UAI_ReplayBufferManager::GetSamplesInStagingFile() const
+{
+    const FString StagingPath = GetStagingPath();
+
+    FString FileData;
+    if (!FFileHelper::LoadFileToString(FileData, *StagingPath))
+        return 0;
+
+    TSharedPtr<FJsonValue> RootValue;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileData);
+    if (!FJsonSerializer::Deserialize(Reader, RootValue) ||
+        !RootValue.IsValid() ||
+        RootValue->Type != EJson::Array)
+        return 0;
+
+    return RootValue->AsArray().Num();
+}
+
 // ================================================================
 // FlushPartialToDisk
 // ================================================================
@@ -380,6 +579,7 @@ bool UAI_ReplayBufferManager::FlushPartialToDisk()
 
     const FString StagingPath = GetStagingPath();
 
+    // ---- Load existing staging samples ----
     TArray<FMCTSTrainingSample> StagingBuffer;
     FString FileData;
     if (FFileHelper::LoadFileToString(FileData, *StagingPath))
@@ -402,6 +602,7 @@ bool UAI_ReplayBufferManager::FlushPartialToDisk()
         }
     }
 
+    // ---- Append current buffer with placeholder value targets ----
     for (const FMCTSTrainingSample& S : Buffer)
     {
         FMCTSTrainingSample Copy = S;
@@ -409,30 +610,23 @@ bool UAI_ReplayBufferManager::FlushPartialToDisk()
         StagingBuffer.Add(MoveTemp(Copy));
     }
 
+    // ---- Serialize flat array (no phase grouping in staging) ----
     TArray<TSharedPtr<FJsonValue>> RootArray;
     for (const FMCTSTrainingSample& Sample : StagingBuffer)
     {
-        TArray<TSharedPtr<FJsonValue>> NodeJson;
-        for (float V : Sample.NodeFeatures)
-            NodeJson.Add(MakeShared<FJsonValueNumber>(V));
-        TArray<TSharedPtr<FJsonValue>> GlobalJson;
-        for (float V : Sample.GlobalFeatures)
-            GlobalJson.Add(MakeShared<FJsonValueNumber>(V));
-        TArray<TSharedPtr<FJsonValue>> PolicyJson;
-        for (float V : Sample.PolicyTarget)
-            PolicyJson.Add(MakeShared<FJsonValueNumber>(V));
-        TArray<TSharedPtr<FJsonValue>> ValueJson;
-        for (float V : Sample.ValueTarget)
-            ValueJson.Add(MakeShared<FJsonValueNumber>(V));
-
         TSharedPtr<FJsonObject> SObj = MakeShared<FJsonObject>();
-        SObj->SetArrayField(TEXT("node_features"), NodeJson);
-        SObj->SetArrayField(TEXT("global_features"), GlobalJson);
-        SObj->SetArrayField(TEXT("policy_target"), PolicyJson);
-        SObj->SetArrayField(TEXT("value_target"), ValueJson);
+        SObj->SetArrayField(TEXT("node_features"),
+            FloatArrayToJson(Sample.NodeFeatures));
+        SObj->SetArrayField(TEXT("global_features"),
+            FloatArrayToJson(Sample.GlobalFeatures));
+        SObj->SetArrayField(TEXT("policy_target"),
+            FloatArrayToJson(Sample.PolicyTarget));
+        SObj->SetArrayField(TEXT("value_target"),
+            FloatArrayToJson(Sample.ValueTarget));
         SObj->SetNumberField(TEXT("phase_id"), Sample.PhaseId);
         SObj->SetNumberField(TEXT("player_id"), Sample.PlayerId);
-        SerializeEntityList(Sample, SObj);
+        TSharedPtr<FJsonObject> SampleObj = SObj;
+        SerializeEntityList(Sample, SampleObj);
         RootArray.Add(MakeShared<FJsonValueObject>(SObj));
     }
 
@@ -448,11 +642,6 @@ bool UAI_ReplayBufferManager::FlushPartialToDisk()
     if (bSuccess)
         Buffer.Empty();
 
-    UE_LOG(LogTemp, Log,
-        TEXT("FlushPartialToDisk: StagingCount=%d Success=%s"),
-        StagingBuffer.Num(),
-        bSuccess ? TEXT("true") : TEXT("false"));
-
     return bSuccess;
 }
 
@@ -464,24 +653,21 @@ bool UAI_ReplayBufferManager::ApplyOutcomeValuesToEpisode(
 {
     if (OutcomeValues.Num() != NUM_PLAYERS)
     {
-        UE_LOG(LogTemp, Error,
-            TEXT("ApplyOutcomeValuesToEpisode: invalid OutcomeValues size %d"),
-            OutcomeValues.Num());
         return false;
     }
 
     const FString StagingPath = GetStagingPath();
 
+    // No staging file — all samples still in memory.
+    // ExportReplayBuffer handles them normally.
     if (!FPaths::FileExists(StagingPath))
         return true;
 
+    // ---- Load staging samples ----
     TArray<FMCTSTrainingSample> StagingBuffer;
     FString FileData;
     if (!FFileHelper::LoadFileToString(FileData, *StagingPath))
     {
-        UE_LOG(LogTemp, Error,
-            TEXT("ApplyOutcomeValuesToEpisode: failed to load %s"),
-            *StagingPath);
         return false;
     }
 
@@ -491,8 +677,6 @@ bool UAI_ReplayBufferManager::ApplyOutcomeValuesToEpisode(
         !RootValue.IsValid() ||
         RootValue->Type != EJson::Array)
     {
-        UE_LOG(LogTemp, Error,
-            TEXT("ApplyOutcomeValuesToEpisode: failed to parse staging file"));
         return false;
     }
 
@@ -506,6 +690,7 @@ bool UAI_ReplayBufferManager::ApplyOutcomeValuesToEpisode(
         StagingBuffer.Add(MoveTemp(Sample));
     }
 
+    // ---- Apply actual outcome values ----
     for (FMCTSTrainingSample& Sample : StagingBuffer)
     {
         Sample.ValueTarget.SetNum(NUM_PLAYERS);
@@ -513,17 +698,16 @@ bool UAI_ReplayBufferManager::ApplyOutcomeValuesToEpisode(
             Sample.ValueTarget[p] = OutcomeValues[p];
     }
 
+    // ---- Append corrected samples directly to TotalReplayBuffer ----
     TArray<FMCTSTrainingSample> TotalBuffer = LoadTotalBufferFromDisk();
     TotalBuffer.Append(StagingBuffer);
     NewSamplesSinceLastTraining += StagingBuffer.Num();
+    SaveTrainingMetadata();
     EnforceCapacity(TotalBuffer);
     SerializeToDisk(TotalBuffer, GetTotalReplayBufferExportPath());
 
+    // ---- Delete staging file ----
     IFileManager::Get().Delete(*StagingPath);
-
-    UE_LOG(LogTemp, Log,
-        TEXT("ApplyOutcomeValuesToEpisode: applied outcomes to %d staged samples"),
-        StagingBuffer.Num());
 
     return true;
 }
@@ -544,8 +728,16 @@ UAI_ReplayBufferManager& UAI_ReplayBufferManager::Get()
 bool UAI_ReplayBufferManager::ExportReplayBuffer(
     const TArray<float>& FinalOutcomeValues)
 {
+    // ----------------------------------------------------------------
+    // STEP 1: LOAD EXISTING TOTAL REPLAY BUFFER FROM DISK
+    // ----------------------------------------------------------------
     TArray<FMCTSTrainingSample> TotalBuffer = LoadTotalBufferFromDisk();
 
+    // ----------------------------------------------------------------
+    // STEP 2: APPLY FINAL GAME REWARDS TO IN-MEMORY BUFFER ONLY
+    // Staged samples were already written to disk with correct values
+    // by ApplyOutcomeValuesToEpisode — do not apply again.
+    // ----------------------------------------------------------------
     const int32 ExpectedPlayers = FinalOutcomeValues.Num();
     if (ExpectedPlayers <= 0)
     {
@@ -566,32 +758,46 @@ bool UAI_ReplayBufferManager::ExportReplayBuffer(
         }
     }
 
+    // ----------------------------------------------------------------
+    // STEP 3: MERGE IN-MEMORY BUFFER INTO TOTAL BUFFER
+    // ----------------------------------------------------------------
     if (Buffer.Num() > 0)
     {
         TotalBuffer.Append(Buffer);
         NewSamplesSinceLastTraining += Buffer.Num();
+        SaveTrainingMetadata();
     }
     Buffer.Empty();
 
+    // ----------------------------------------------------------------
+    // STEP 4: PRUNE
+    // ----------------------------------------------------------------
     EnforceCapacity(TotalBuffer);
 
+    // ----------------------------------------------------------------
+    // STEP 5: VALIDATE
+    // ----------------------------------------------------------------
     for (const FMCTSTrainingSample& Sample : TotalBuffer)
     {
         if (!IsValidTrainingSample(Sample))
         {
-            UE_LOG(LogTemp, Warning,
-                TEXT("ExportReplayBuffer: invalid sample skipped "
-                    "(PhaseId=%d PlayerId=%d NodeFeatures=%d Policy=%d)"),
-                Sample.PhaseId, Sample.PlayerId,
-                Sample.NodeFeatures.Num(), Sample.PolicyTarget.Num());
+            for (int32 i = TotalBuffer.Num() - 1; i >= 0; i--)
+            {
+                if (!IsValidTrainingSample(TotalBuffer[i]))
+                    TotalBuffer.RemoveAt(i);
+            }
         }
     }
 
+    // ----------------------------------------------------------------
+    // STEP 6: SERIALIZE
+    // ----------------------------------------------------------------
     return SerializeToDisk(TotalBuffer, GetTotalReplayBufferExportPath());
 }
 
 void UAI_ReplayBufferManager::StoreSelfPlaySample(const FMCTSTree& Tree)
 {
+
     if (!Tree.Nodes.IsValidIndex(Tree.RootIndex))
         return;
     const FMCTSNode& Root = Tree.Nodes[Tree.RootIndex];
@@ -727,7 +933,6 @@ void UAI_ReplayBufferManager::AddSample(const FMCTSTrainingSample& Sample)
     // ------------------------------------------------------------
     // BUFFER INSERTION (NO TRANSFORMATION)
     // ------------------------------------------------------------
-
     if (!IsValidTrainingSample(Sample)) return;
     Buffer.Add(Sample);
 }
@@ -1091,112 +1296,4 @@ void UAI_ReplayBufferManager::ResetNewSampleCounter()
 {
     NewSamplesSinceLastTraining = 0;
     SaveTrainingMetadata();
-}
-
-void UAI_ReplayBufferManager::SaveTrainingMetadata(int32 EpisodeId) const
-{
-    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetNumberField(TEXT("new_samples_since_last_training"), NewSamplesSinceLastTraining);
-    Obj->SetNumberField(TEXT("current_episode_id"), EpisodeId);
-
-    FString Output;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
-    FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
-
-    const FString Path = GetTrainingMetadataPath();
-    const FString Dir = FPaths::GetPath(Path);
-    if (!Dir.IsEmpty())
-        IFileManager::Get().MakeDirectory(*Dir, true);
-
-    FFileHelper::SaveStringToFile(Output, *Path);
-}
-
-void UAI_ReplayBufferManager::SaveTrainingMetadata() const
-{
-    int32 ExistingEpisodeId = 0;
-    const FString Path = GetTrainingMetadataPath();
-    FString FileData;
-    if (FFileHelper::LoadFileToString(FileData, *Path))
-    {
-        TSharedPtr<FJsonObject> Obj;
-        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileData);
-        if (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid())
-        {
-            int32 Loaded = 0;
-            if (Obj->TryGetNumberField(TEXT("current_episode_id"), Loaded))
-                ExistingEpisodeId = FMath::Max(0, Loaded);
-        }
-    }
-
-    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetNumberField(TEXT("new_samples_since_last_training"), NewSamplesSinceLastTraining);
-    Obj->SetNumberField(TEXT("current_episode_id"), ExistingEpisodeId);
-
-    FString Output;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
-    FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
-
-    const FString Dir = FPaths::GetPath(Path);
-    if (!Dir.IsEmpty())
-        IFileManager::Get().MakeDirectory(*Dir, true);
-
-    FFileHelper::SaveStringToFile(Output, *Path);
-}
-
-void UAI_ReplayBufferManager::LoadTrainingMetadata(int32& OutEpisodeId)
-{
-    const FString Path = GetTrainingMetadataPath();
-
-    FString FileData;
-    if (!FFileHelper::LoadFileToString(FileData, *Path))
-    {
-        NewSamplesSinceLastTraining = 0;
-        OutEpisodeId = 0;
-        return;
-    }
-
-    TSharedPtr<FJsonObject> Obj;
-    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileData);
-
-    if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
-    {
-        NewSamplesSinceLastTraining = 0;
-        OutEpisodeId = 0;
-        return;
-    }
-
-    int32 Loaded = 0;
-    if (Obj->TryGetNumberField(TEXT("new_samples_since_last_training"), Loaded))
-        NewSamplesSinceLastTraining = FMath::Max(0, Loaded);
-
-    int32 LoadedEpisodeId = 0;
-    if (Obj->TryGetNumberField(TEXT("current_episode_id"), LoadedEpisodeId))
-        OutEpisodeId = FMath::Max(0, LoadedEpisodeId);
-    else
-        OutEpisodeId = 0;
-}
-
-void UAI_ReplayBufferManager::LoadTrainingMetadata()
-{
-    const FString Path = GetTrainingMetadataPath();
-
-    FString FileData;
-    if (!FFileHelper::LoadFileToString(FileData, *Path))
-    {
-        NewSamplesSinceLastTraining = 0;
-        return;
-    }
-
-    TSharedPtr<FJsonObject> Obj;
-    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileData);
-
-    if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
-    {
-        NewSamplesSinceLastTraining = 0;
-        return;
-    }
-
-    int32 Loaded = 0;
-    if (Obj->TryGetNumberField(TEXT("new_samples_since_last_training"), Loaded))
-        NewSamplesSinceLastTraining = FMath::Max(0, Loaded);
 }

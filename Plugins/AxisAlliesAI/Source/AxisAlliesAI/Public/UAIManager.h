@@ -141,6 +141,80 @@ class AXISALLIESAI_API UAIManager : public UObject
     GENERATED_BODY()
 
 public:
+    // Set pending action context when loading
+    UFUNCTION(BlueprintCallable, Category = "AI|MCTS")
+    void SetPendingActionContext(
+        int32 PendingActionA,
+        int32 PendingActionB,
+        int32 PendingActionC,
+        int32 PendingActionD)
+    {
+        PendingRootActionContext.PendingActionA = PendingActionA;
+        PendingRootActionContext.PendingActionB = PendingActionB;
+        PendingRootActionContext.PendingActionC = PendingActionC;
+        PendingRootActionContext.PendingActionD = PendingActionD;
+        PendingRootActionContext.bIsValid = true;
+    }
+    // Gets total number of samples in current staging file
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    int32 GetSamplesInStagingFile() const
+    {
+        return UAI_ReplayBufferManager::Get().GetSamplesInStagingFile();
+    }
+    // Clears the MCTS tree after dice rolls
+    UFUNCTION(BlueprintCallable, Category = "AI|MCTS")
+    void InvalidateMCTSTree()
+    {
+        ResetMCTS();
+        Tree = FMCTSTree();
+    }
+    // Clears in-memory samples without saving them
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    void ClearSamplesInMemory()
+    {
+        UAI_ReplayBufferManager::Get().ClearBuffer();
+    }
+    // Returns number of samples currently in memory
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    int32 GetSamplesInMemory() const
+    {
+        return UAI_ReplayBufferManager::Get().GetSamplesInMemory();
+    }
+
+    // Returns all staging session file names without extension
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    TArray<FString> GetStagingFileNames() const
+    {
+        return UAI_ReplayBufferManager::Get().GetStagingFileNames();
+    }
+
+    // Sets the current staging session name without loading
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    void SetStagingSessionName(const FString& SessionName)
+    {
+        UAI_ReplayBufferManager::Get().SetStagingSessionName(SessionName);
+    }
+
+    // Sets the current staging session name and confirms file exists
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    bool LoadStagingSession(const FString& SessionName)
+    {
+        return UAI_ReplayBufferManager::Get().LoadStagingSession(SessionName);
+    }
+
+    // Immediately flushes all in-memory samples to current staging file
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    bool FlushInMemorySamplesToStaging()
+    {
+        return UAI_ReplayBufferManager::Get().FlushPartialToDisk();
+    }
+
+    // Deletes the staging file for the given session name
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    bool DeleteStagingFile(const FString& SessionName)
+    {
+        return UAI_ReplayBufferManager::Get().DeleteStagingFile(SessionName);
+    }
     UFUNCTION(BlueprintCallable, Category = "AI|Training")
     int32 GetSamplesOnDisk() const
     {
@@ -379,6 +453,8 @@ public:
         int32& OutRound);
 
 private:
+    FPendingActionContext PendingRootActionContext;
+
     bool SampleCombatDice(int32 NodeIndex);
     bool SimulateCombatRoundInternal(int32 NodeIndex);
 
@@ -490,4 +566,6 @@ private:
     bool bTerritoryGraphLoaded = false;
     TMap<int32, FString>       CachedNodeNames;
     TMap<int32, TArray<int32>> CachedAdjacency;
+
+    FRandomStream MCTSRandStream;
 };

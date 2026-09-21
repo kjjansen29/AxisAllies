@@ -57,6 +57,14 @@ struct FMCTSTrainingSample
 class AXISALLIESAI_API UAI_ReplayBufferManager
 {
 public:
+    int32 GetSamplesInStagingFile() const;
+    void ClearBuffer();
+    TArray<FString> GetStagingFileNames() const;
+    void SetStagingSessionName(const FString& SessionName);
+    FString GetCurrentStagingSessionName() const { return CurrentStagingSessionName; }
+    bool LoadStagingSession(const FString& SessionName);
+    bool DeleteStagingFile(const FString& SessionName);
+
     static UAI_ReplayBufferManager& Get();
 
     void AddSample(const FMCTSTrainingSample& Sample);
@@ -125,4 +133,7 @@ private:
     int32 MaxCapacity = 100000;
     int32 NewSamplesSinceLastTraining = 0;
     bool  bMetadataLoaded = false;
+    FString GetStagingPath() const;
+    FString GetStagingDirectory() const;
+    FString CurrentStagingSessionName = TEXT("Default");
 };
