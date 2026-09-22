@@ -616,7 +616,7 @@ void UAIManager::BeginMCTS(
 
         //UE_LOG(LogTemp, Warning,
             //TEXT("BeginMCTS: RunSimulations starting (existing root). TreeNodes=%d NumSims=%d"),
-            Tree.Nodes.Num(), NumSimulations);
+            //Tree.Nodes.Num(), NumSimulations);
         RunSimulations(RootIndexForBudget, NumSimulations);
         FlushInferenceBatch();
         //UE_LOG(LogTemp, Warning,
