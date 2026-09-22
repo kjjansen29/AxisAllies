@@ -1,4 +1,4 @@
-AxisAllies/Binaries/Win64/AxisAllies.exe	2026-09-22T05:47:50.046Z
+AxisAllies/Binaries/Win64/AxisAllies.exe	2026-09-22T06:22:20.434Z
 AxisAllies/Binaries/Win64/D3D12/x64/D3D12Core.dll	2026-04-23T07:42:31.512Z
 AxisAllies/Binaries/Win64/D3D12/x64/d3d12SDKLayers.dll	2026-04-23T07:42:31.626Z
 AxisAllies/Binaries/Win64/DML/x64/DirectML.dll	2026-04-23T07:42:07.419Z
@@ -17,7 +17,7 @@ Engine/Binaries/ThirdParty/Windows/XAudio2_9/x64/xaudio2_9redist.dll	2026-04-23T
 Engine/Content/Renderer/TessellationTable.bin	2026-04-23T07:31:28.539Z
 Engine/Content/Slate/Cursor/invisible.cur	2026-04-23T07:31:28.574Z
 Engine/Plugins/NNE/NNERuntimeORT/Binaries/ThirdParty/Onnxruntime/Win64/onnxruntime.dll	2026-04-23T07:39:40.490Z
-Engine/Config/StagedBuild_AxisAllies.ini	2026-09-22T05:49:36.381Z
+Engine/Config/StagedBuild_AxisAllies.ini	2026-09-22T06:24:07.429Z
 AxisAllies/Content/PythonAI/AITerritoryGraph.json	2026-09-06T03:43:14.872Z
 AxisAllies/Content/PythonAI/axis_allies.onnx	2026-09-17T02:43:02.797Z
 AxisAllies/Content/PythonAI/axis_allies.pt	2026-09-17T02:43:00.355Z
@@ -39,4 +39,4 @@ Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_synchronization2.dll	202
 Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_synchronization2.json	2026-04-23T07:29:12.417Z
 Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_validation.dll	2026-04-23T07:29:12.801Z
 Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_validation.json	2026-04-23T07:29:12.804Z
-AxisAllies.exe	2026-09-22T05:49:36.371Z
+AxisAllies.exe	2026-09-22T06:24:07.406Z

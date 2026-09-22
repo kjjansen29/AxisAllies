@@ -141,6 +141,16 @@ class AXISALLIESAI_API UAIManager : public UObject
     GENERATED_BODY()
 
 public:
+    //
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    void BeginStagingSession()
+    {
+        UAI_ReplayBufferManager::Get().BeginGameSession();
+        CurrentGameSampleCount = 0;
+        bEpisodeTerminalLocked = false;
+        LastSampledActionRootIndex = INDEX_NONE;
+        bHasEmittedRootSampleThisStep = false;
+    }
     // Set pending action context when loading
     UFUNCTION(BlueprintCallable, Category = "AI|MCTS")
     void SetPendingActionContext(
