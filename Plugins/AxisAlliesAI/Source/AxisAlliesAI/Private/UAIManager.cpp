@@ -239,7 +239,11 @@ void UAIManager::BeginMCTS(
     }
 
     const int32 ExistingRoot =
-        FindExistingNodeByState(GameState, PhaseId, PlayerId);
+        (Tree.Nodes.IsValidIndex(Tree.RootIndex) &&
+            Tree.GetNode(Tree.RootIndex).PhaseId == PhaseId &&
+            Tree.GetNode(Tree.RootIndex).PlayerId == PlayerId)
+        ? Tree.RootIndex
+        : INDEX_NONE;
 
     // ----------------------------------------------------------------
     // Per-simulation state for the pending-set batched MCTS
@@ -578,12 +582,17 @@ void UAIManager::BeginMCTS(
     {
         Tree.RootIndex = ExistingRoot;
 
-        Tree.Nodes[ExistingRoot].NodeFeatures = ExtractNodeFeatures(GameState);
-        Tree.Nodes[ExistingRoot].GlobalFeatures = ExtractGlobalFeatures(GameState);
-        ClearAllEntityListsExcept(ExistingRoot);
-        Tree.Nodes[ExistingRoot].EntityLists = InEntityLists;
-        if (Tree.Nodes[ExistingRoot].EntityLists.Num() != NUM_TERRITORIES)
-            Tree.Nodes[ExistingRoot].EntityLists.SetNum(NUM_TERRITORIES);
+        if (PendingRootActionContext.bIsValid)
+        {
+            Tree.Nodes[ExistingRoot].PendingActionContext = PendingRootActionContext;
+            for (int32 ChildIdx : Tree.Nodes[ExistingRoot].ChildIndices)
+            {
+                if (Tree.Nodes.IsValidIndex(ChildIdx))
+                    Tree.Nodes[ChildIdx].PendingActionContext.PendingActionA =
+                    PendingRootActionContext.PendingActionA;
+            }
+            PendingRootActionContext = FPendingActionContext();
+        }
 
         const int32 RootIndexForBudget = Tree.RootIndex;
         const int32 NumSimulations =
@@ -605,9 +614,19 @@ void UAIManager::BeginMCTS(
         if (IsTrainingMode())
             ApplyRootDirichletNoise(RootNode, 0.25f, 0.3f);
 
+        UE_LOG(LogTemp, Warning,
+            TEXT("BeginMCTS: RunSimulations starting (existing root). TreeNodes=%d NumSims=%d"),
+            Tree.Nodes.Num(), NumSimulations);
         RunSimulations(RootIndexForBudget, NumSimulations);
         FlushInferenceBatch();
-
+        UE_LOG(LogTemp, Warning,
+            TEXT("ExistingRoot: bPolicyInitialized=%s LegalMaskNum=%d VisitCount=%d"),
+            RootNode.bPolicyInitialized ? TEXT("true") : TEXT("false"),
+            RootNode.LegalActionMask.Num(),
+            RootNode.VisitCount);
+        UE_LOG(LogTemp, Warning,
+            TEXT("BeginMCTS: RunSimulations complete (existing root). TreeNodes=%d"),
+            Tree.Nodes.Num());
         return;
     }
 
@@ -652,8 +671,14 @@ void UAIManager::BeginMCTS(
     if (IsTrainingMode())
         ApplyRootDirichletNoise(RootNode, 0.25f, 0.3f);
 
+    UE_LOG(LogTemp, Warning,
+        TEXT("BeginMCTS: RunSimulations starting (new root). TreeNodes=%d NumSims=%d"),
+        Tree.Nodes.Num(), NumSimulations);
     RunSimulations(RootIndex, NumSimulations);
     FlushInferenceBatch();
+    UE_LOG(LogTemp, Warning,
+        TEXT("BeginMCTS: RunSimulations complete (new root). TreeNodes=%d"),
+        Tree.Nodes.Num());
 }
 
 int32 UAIManager::CreateRootNode(
@@ -690,13 +715,6 @@ int32 UAIManager::CreateRootNode(
     RootNode.MCTSValuePerPlayer.Init(0.0f, NumPlayers);
 
     const int32 RootIndex = Tree.CreateNode(RootNode);
-
-    if (PendingRootActionContext.bIsValid)
-    {
-        Tree.Nodes[RootIndex].PendingActionContext = PendingRootActionContext;
-        PendingRootActionContext = FPendingActionContext(); // reset
-    }
-
     Tree.RootIndex = RootIndex;
 
     const FApplyActionResult MaskResult = Internal_GetLegalActionMask(
@@ -726,8 +744,10 @@ int32 UAIManager::CreateRootNode(
 
 void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
 {
-    FMCTSNode& Parent = Tree.GetNode(NodeIndex);
-    Parent.bIsExpanded = true;
+    // Copy parent node by value immediately to avoid dangling references
+    // if Tree.Nodes reallocates during a subsequent CreateNode call.
+    const FMCTSNode Parent = Tree.GetNode(NodeIndex);
+    Tree.GetNode(NodeIndex).bIsExpanded = true;
 
     TArray<float> CombinedState;
     CombinedState.Reserve(Parent.NodeFeatures.Num() + Parent.GlobalFeatures.Num());
@@ -884,6 +904,10 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             Parent.EntityLists
         );
 
+        UE_LOG(LogTemp, Warning,
+            TEXT("ExpandNode: ParentPhaseId=%d Action=%d Result.OutPhaseId=%d OutState.Num=%d OutEntityLists.Num=%d"),
+            Parent.PhaseId, Action, Result.OutPhaseId, Result.OutState.Num(), Result.OutEntityLists.Num());
+
         Child.NodeFeatures = ExtractNodeFeatures(Result.OutState);
         Child.GlobalFeatures = ExtractGlobalFeatures(Result.OutState);
         Child.EntityLists = Result.OutEntityLists;
@@ -893,6 +917,17 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
         Child.ActionFromParent = Action;
         Child.bIsTerminal = Result.bIsTerminal;
         Child.LegalActionMask = Result.OutLegalActionMask;
+
+        if (Parent.PhaseId == static_cast<int32>(EPhaseId::CombatMoveQuantity))
+        {
+            const int32 Territory = EffectivePendingActionA > 0
+                ? (EffectivePendingActionA - 1) / 20 : -1;
+            const int32 EntityCount = Child.EntityLists.IsValidIndex(Territory) ?
+                Child.EntityLists[Territory].Entities.Num() : -1;
+            UE_LOG(LogTemp, Warning,
+                TEXT("Phase19 child: Territory=%d EntityCount=%d OutEntityLists.Num=%d Child.PhaseId=%d"),
+                Territory, EntityCount, Result.OutEntityLists.Num(), Child.PhaseId);
+        }
 
         if (Child.EntityLists.Num() != NUM_TERRITORIES)
             Child.EntityLists.SetNum(NUM_TERRITORIES);
@@ -1957,6 +1992,31 @@ void UAIManager::FinalizeMCTS()
     bRootFinalized = true;
 }
 
+// ============================================================
+// UAIManager — Async MCTS and Training Pipeline
+// ============================================================
+// GetActionFromMCTS: augmented to run MCTS on a background
+// thread. Returns -1 immediately; result delivered via
+// OnMCTSComplete delegate on the game thread.
+//
+// FinalizeMCTSTrainingPipeline: augmented to run training on
+// a background thread. Progress delivered via OnTrainingProgress
+// delegate (0.0-1.0). Completion via OnTrainingComplete.
+//
+// CancelMCTS: sets bCancelRequested flag; RunSimulations checks
+// this flag at the start of each outer loop iteration and exits
+// cleanly, removing virtual losses and backpropagating.
+// ============================================================
+
+#include "Async/Async.h"
+#include "HAL/PlatformProcess.h"
+#include "Misc/Paths.h"
+
+// ------------------------------------------------------------
+// GetActionFromMCTS — async augmentation
+// Existing synchronous body moved into background thread.
+// Blueprint binds OnMCTSComplete to receive the action.
+// ------------------------------------------------------------
 int32 UAIManager::GetActionFromMCTS(
     const TArray<float>& GameState,
     int32 PhaseId,
@@ -1965,11 +2025,7 @@ int32 UAIManager::GetActionFromMCTS(
     const TArray<FTerritoryEntityList>& InEntityLists)
 {
     if (!InGameState || GameState.Num() == 0)
-    {
-        UE_LOG(LogTemp, Warning,
-            TEXT("GAME STATE ISSUE"));
         return -1;
-    }
 
     if (bMCTSRunning)
     {
@@ -2069,9 +2125,28 @@ int32 UAIManager::GetActionFromMCTS(
 
             if (bValidAction && Tree.Nodes.IsValidIndex(RootIndex))
             {
-                const int32 NewRoot = PromoteRootToChild(RootIndex, Action);
-                if (NewRoot == INDEX_NONE)
+                // Find child matching selected action and set as new root
+                int32 NewRootIndex = INDEX_NONE;
+                for (int32 ChildIdx : Tree.GetNode(RootIndex).ChildIndices)
+                {
+                    if (Tree.Nodes.IsValidIndex(ChildIdx) &&
+                        Tree.GetNode(ChildIdx).ActionFromParent == Action)
+                    {
+                        NewRootIndex = ChildIdx;
+                        break;
+                    }
+                }
+
+                if (NewRootIndex != INDEX_NONE)
+                {
+                    Tree.RootIndex = NewRootIndex;
+                    Tree.GetNode(NewRootIndex).ParentIndex = INDEX_NONE;
+                    Tree.GetNode(NewRootIndex).ActionFromParent = -1;
+                }
+                else
+                {
                     ResetMCTS();
+                }
             }
             else
             {
@@ -2360,6 +2435,9 @@ int32 UAIManager::FindExistingNodeByState(
     if (GameState.Num() < NodeFeatureSize)
         return INDEX_NONE;
 
+    UE_LOG(LogTemp, Warning, TEXT("FindExistingNodeByState: PhaseId=%d PlayerId=%d TreeNodes=%d"),
+        PhaseId, PlayerId, Tree.Nodes.Num());
+
     // Hash node features only for quick pre-filter
     const uint32 NodeFeatureHash = FCrc::MemCrc32(
         GameState.GetData(),
@@ -2406,8 +2484,11 @@ int32 UAIManager::FindExistingNodeByState(
                 continue;
         }
 
+        UE_LOG(LogTemp, Warning, TEXT("FindExistingNodeByState: Found match at NodeIndex=%d"), i);
         return i;
     }
+
+    UE_LOG(LogTemp, Warning, TEXT("FindExistingNodeByState: No match found"));
     return INDEX_NONE;
 }
 
@@ -2467,7 +2548,6 @@ bool UAIManager::ValidateInferenceOutputsNumerical(
 
 int32 UAIManager::PromoteRootToChild(int32 CurrentRootIndex, int32 Action)
 {
-
     if (!Tree.Nodes.IsValidIndex(CurrentRootIndex))
     {
         return INDEX_NONE;
@@ -2507,7 +2587,6 @@ int32 UAIManager::PromoteRootToChild(int32 CurrentRootIndex, int32 Action)
 
     ensureMsgf(NewRoot.LegalActionMask.Num() > 0, TEXT("Promoted root missing legal mask"));
 
-    // FEATURE-BASED INTEGRITY CHECK (replaces legacy State validation)
     ensureMsgf(
         NewRoot.NodeFeatures.Num() > 0,
         TEXT("Promoted root missing node features")
@@ -2528,6 +2607,18 @@ int32 UAIManager::PromoteRootToChild(int32 CurrentRootIndex, int32 Action)
         if (ChildNode.ParentIndex != NewRootIndex)
         {
             ChildNode.ParentIndex = NewRootIndex;
+        }
+    }
+
+    // Propagate new root's PendingActionContext to all children
+    if (NewRoot.PendingActionContext.bIsValid)
+    {
+        for (int32 ChildIndex : NewRoot.ChildIndices)
+        {
+            if (!Tree.Nodes.IsValidIndex(ChildIndex))
+                continue;
+            FMCTSNode& ChildNode = Tree.GetNode(ChildIndex);
+            ChildNode.PendingActionContext = NewRoot.PendingActionContext;
         }
     }
 
