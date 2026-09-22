@@ -614,19 +614,19 @@ void UAIManager::BeginMCTS(
         if (IsTrainingMode())
             ApplyRootDirichletNoise(RootNode, 0.25f, 0.3f);
 
-        UE_LOG(LogTemp, Warning,
-            TEXT("BeginMCTS: RunSimulations starting (existing root). TreeNodes=%d NumSims=%d"),
+        //UE_LOG(LogTemp, Warning,
+            //TEXT("BeginMCTS: RunSimulations starting (existing root). TreeNodes=%d NumSims=%d"),
             Tree.Nodes.Num(), NumSimulations);
         RunSimulations(RootIndexForBudget, NumSimulations);
         FlushInferenceBatch();
-        UE_LOG(LogTemp, Warning,
-            TEXT("ExistingRoot: bPolicyInitialized=%s LegalMaskNum=%d VisitCount=%d"),
-            RootNode.bPolicyInitialized ? TEXT("true") : TEXT("false"),
-            RootNode.LegalActionMask.Num(),
-            RootNode.VisitCount);
-        UE_LOG(LogTemp, Warning,
-            TEXT("BeginMCTS: RunSimulations complete (existing root). TreeNodes=%d"),
-            Tree.Nodes.Num());
+        //UE_LOG(LogTemp, Warning,
+            //TEXT("ExistingRoot: bPolicyInitialized=%s LegalMaskNum=%d VisitCount=%d"),
+            //RootNode.bPolicyInitialized ? TEXT("true") : TEXT("false"),
+            //RootNode.LegalActionMask.Num(),
+            //RootNode.VisitCount);
+        //UE_LOG(LogTemp, Warning,
+            //TEXT("BeginMCTS: RunSimulations complete (existing root). TreeNodes=%d"),
+            //Tree.Nodes.Num());
         return;
     }
 
