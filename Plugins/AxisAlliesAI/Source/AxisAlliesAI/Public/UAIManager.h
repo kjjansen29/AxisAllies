@@ -133,6 +133,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMCTSComplete, int32, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnAIModelActionComplete, int32, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnTrainingComplete);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnTrainingProgress, float, ProgressPercent, FTrainingStats, Stats);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnSamplesFlushedDelegate);
 
 
 UCLASS()
@@ -141,6 +142,14 @@ class AXISALLIESAI_API UAIManager : public UObject
     GENERATED_BODY()
 
 public:
+    UFUNCTION(BlueprintCallable, Category = "AI|Debug")
+    TArray<FTerritoryEntityList> DebugSimulateTransition(
+        const TArray<float>& InState, int32 InPhaseId, int32 InPlayerId, int32 Action,
+        int32 PendingA, int32 PendingB, int32 PendingC, int32 PendingD,
+        const TArray<FTerritoryEntityList>& InEntityLists);
+
+    UPROPERTY(BlueprintAssignable, Category = "AI|Training")
+    FOnSamplesFlushedDelegate OnSamplesFlushed;
     //
     UFUNCTION(BlueprintCallable, Category = "AI|Training")
     void BeginStagingSession()
@@ -491,7 +500,7 @@ private:
         const TArray<FTerritoryEntityList>& InEntityLists);
 
     static constexpr int32 StubMaxChainDepth = 20;
-    static constexpr int32 ReplayBufferFlushThreshold = 100;
+    static constexpr int32 ReplayBufferFlushThreshold = 50;
 
     FApplyActionResult Internal_SimulateTransition(
         const TArray<float>& InState,

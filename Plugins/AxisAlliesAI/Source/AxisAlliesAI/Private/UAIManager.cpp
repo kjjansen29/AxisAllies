@@ -582,6 +582,23 @@ void UAIManager::BeginMCTS(
     {
         Tree.RootIndex = ExistingRoot;
 
+        // TEST: log every territory where the reused root differs from the real game.
+        {
+            const FMCTSNode& DiagRoot = Tree.GetNode(ExistingRoot);
+            for (int32 t = 0; t < InEntityLists.Num(); t++)
+            {
+                const int32 RootNum = DiagRoot.EntityLists.IsValidIndex(t)
+                    ? DiagRoot.EntityLists[t].Entities.Num() : -1;
+                const int32 RealNum = InEntityLists[t].Entities.Num();
+                if (RootNum != RealNum)
+                {
+                    UE_LOG(LogTemp, Warning,
+                        TEXT("Root %d Phase %d: Territory %d root=%d real=%d"),
+                        ExistingRoot, PhaseId, t, RootNum, RealNum);
+                }
+            }
+        }
+
         if (PendingRootActionContext.bIsValid)
         {
             Tree.Nodes[ExistingRoot].PendingActionContext = PendingRootActionContext;
@@ -671,14 +688,8 @@ void UAIManager::BeginMCTS(
     if (IsTrainingMode())
         ApplyRootDirichletNoise(RootNode, 0.25f, 0.3f);
 
-    UE_LOG(LogTemp, Warning,
-        TEXT("BeginMCTS: RunSimulations starting (new root). TreeNodes=%d NumSims=%d"),
-        Tree.Nodes.Num(), NumSimulations);
     RunSimulations(RootIndex, NumSimulations);
     FlushInferenceBatch();
-    UE_LOG(LogTemp, Warning,
-        TEXT("BeginMCTS: RunSimulations complete (new root). TreeNodes=%d"),
-        Tree.Nodes.Num());
 }
 
 int32 UAIManager::CreateRootNode(
@@ -714,24 +725,34 @@ int32 UAIManager::CreateRootNode(
     RootNode.bIsTerminal = false;
     RootNode.MCTSValuePerPlayer.Init(0.0f, NumPlayers);
 
+    // Apply pending action context if set via SetPendingActionContext
+    if (PendingRootActionContext.bIsValid)
+    {
+        RootNode.PendingActionContext = PendingRootActionContext;
+    }
+
     const int32 RootIndex = Tree.CreateNode(RootNode);
     Tree.RootIndex = RootIndex;
 
+    const bool bHasPending = PendingRootActionContext.bIsValid;
     const FApplyActionResult MaskResult = Internal_GetLegalActionMask(
         GameState,
         PhaseId,
         PlayerId,
-        false,
-        INDEX_NONE,
-        INDEX_NONE,
-        INDEX_NONE,
-        INDEX_NONE,
+        bHasPending,
+        bHasPending ? PendingRootActionContext.PendingActionA : INDEX_NONE,
+        bHasPending ? PendingRootActionContext.PendingActionB : INDEX_NONE,
+        bHasPending ? PendingRootActionContext.PendingActionC : INDEX_NONE,
+        bHasPending ? PendingRootActionContext.PendingActionD : INDEX_NONE,
         RootIndex,
         Tree.Nodes[RootIndex].EntityLists
     );
 
     Tree.Nodes[RootIndex].LegalActionMask = MaskResult.OutLegalActionMask;
     Tree.Nodes[RootIndex].bIsTerminal = MaskResult.bIsTerminal;
+
+    // Reset pending action context after use
+    PendingRootActionContext = FPendingActionContext();
 
     ensureMsgf(
         Tree.Nodes[RootIndex].LegalActionMask.Num() == ActionSpaceSize,
@@ -904,10 +925,6 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             Parent.EntityLists
         );
 
-        UE_LOG(LogTemp, Warning,
-            TEXT("ExpandNode: ParentPhaseId=%d Action=%d Result.OutPhaseId=%d OutState.Num=%d OutEntityLists.Num=%d"),
-            Parent.PhaseId, Action, Result.OutPhaseId, Result.OutState.Num(), Result.OutEntityLists.Num());
-
         Child.NodeFeatures = ExtractNodeFeatures(Result.OutState);
         Child.GlobalFeatures = ExtractGlobalFeatures(Result.OutState);
         Child.EntityLists = Result.OutEntityLists;
@@ -924,9 +941,9 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
                 ? (EffectivePendingActionA - 1) / 20 : -1;
             const int32 EntityCount = Child.EntityLists.IsValidIndex(Territory) ?
                 Child.EntityLists[Territory].Entities.Num() : -1;
-            UE_LOG(LogTemp, Warning,
-                TEXT("Phase19 child: Territory=%d EntityCount=%d OutEntityLists.Num=%d Child.PhaseId=%d"),
-                Territory, EntityCount, Result.OutEntityLists.Num(), Child.PhaseId);
+            // TEST: full inputs/outputs of the Phase 19 SimulateTransition call.
+            const int32 ParentSrcCount = Parent.EntityLists.IsValidIndex(Territory)
+                ? Parent.EntityLists[Territory].Entities.Num() : -1;
         }
 
         if (Child.EntityLists.Num() != NUM_TERRITORIES)
@@ -1044,6 +1061,14 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
     // CRITICAL: re-fetch parent after CreateNode to avoid stale reference
     ChildIndex = Tree.CreateNode(Child);
     Tree.GetNode(NodeIndex).ChildIndices.Add(ChildIndex);
+
+    // TEST: node index of each Phase 19 child, to match against the "Root %d" log.
+    if (ParentPhase == EPhaseId::CombatMoveQuantity)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Phase19 child created: ParentNode=%d Action=%d -> ChildNode=%d"),
+            NodeIndex, Action, ChildIndex);
+    }
     FMCTSNode& CreatedChild = Tree.GetNode(ChildIndex);
 
     // ----------------------------------------------------------------
@@ -2114,11 +2139,15 @@ int32 UAIManager::GetActionFromMCTS(
                     bHasEmittedRootSampleThisStep = true;
                     CurrentGameSampleCount++;
 
-                    // Flush to disk every 100 samples to keep memory usage low
+                    // Flush to disk every 50 samples to keep memory usage low
                     if (UAI_ReplayBufferManager::Get().GetSamplesInMemory() >=
                         ReplayBufferFlushThreshold)
                     {
                         UAI_ReplayBufferManager::Get().FlushPartialToDisk();
+                        AsyncTask(ENamedThreads::GameThread, [this]()
+                            {
+                                OnSamplesFlushed.Broadcast();
+                            });
                     }
                 }
             }
@@ -4820,9 +4849,9 @@ bool UAIManager::LoadInitialGameState(
             TotalFloats, ExpectedFloats);
         return false;
     }
-    StateRoot->TryGetNumberField(TEXT("phase_id"),      OutPhaseId);
+    StateRoot->TryGetNumberField(TEXT("phase_id"), OutPhaseId);
     StateRoot->TryGetNumberField(TEXT("acting_player"), OutActingPlayer);
-    StateRoot->TryGetNumberField(TEXT("round"),         OutRound);
+    StateRoot->TryGetNumberField(TEXT("round"), OutRound);
     const TArray<TSharedPtr<FJsonValue>>* BufferArr = nullptr;
     if (!StateRoot->TryGetArrayField(TEXT("state_buffer"), BufferArr) || !BufferArr)
     {
@@ -4877,8 +4906,8 @@ bool UAIManager::LoadInitialGameState(
         }
     }
     int32 NumTerritories = 0;
-    int32 FeatureCount   = 0;
-    EntityRoot->TryGetNumberField(TEXT("num_territories"),          NumTerritories);
+    int32 FeatureCount = 0;
+    EntityRoot->TryGetNumberField(TEXT("num_territories"), NumTerritories);
     EntityRoot->TryGetNumberField(TEXT("unit_entity_feature_count"), FeatureCount);
     if (NumTerritories != NUM_TERRITORIES)
     {
@@ -4905,17 +4934,17 @@ bool UAIManager::LoadInitialGameState(
     }
     // Helper lambda to safely read a bool field
     auto GetBool = [](const TSharedPtr<FJsonObject>& Obj, const FString& Field) -> bool
-    {
-        const TSharedPtr<FJsonValue>* Val = Obj->Values.Find(Field);
-        return Val && Val->IsValid() && (*Val)->AsBool();
-    };
+        {
+            const TSharedPtr<FJsonValue>* Val = Obj->Values.Find(Field);
+            return Val && Val->IsValid() && (*Val)->AsBool();
+        };
     // Helper lambda to safely read an int32 field
     auto GetInt = [](const TSharedPtr<FJsonObject>& Obj, const FString& Field) -> int32
-    {
-        double Out = 0.0;
-        Obj->TryGetNumberField(Field, Out);
-        return FMath::RoundToInt(Out);
-    };
+        {
+            double Out = 0.0;
+            Obj->TryGetNumberField(Field, Out);
+            return FMath::RoundToInt(Out);
+        };
     int32 TotalEntitiesLoaded = 0;
     for (int32 t = 0; t < EntityListsArr->Num(); t++)
     {
@@ -4941,31 +4970,31 @@ bool UAIManager::LoadInitialGameState(
             const TSharedPtr<FJsonObject> EntityObj = EntityVal->AsObject();
             if (!EntityObj.IsValid()) continue;
             FUnitEntity Entity;
-            Entity.UnitType              = GetInt(EntityObj, TEXT("UnitType"));
-            Entity.OwningPlayer          = GetInt(EntityObj, TEXT("OwningPlayer"));
-            Entity.Count                 = FMath::Max(GetInt(EntityObj, TEXT("Count")), 1);
-            Entity.HitPoints             = GetInt(EntityObj, TEXT("HitPoints"));
-            Entity.MovementRemaining     = GetInt(EntityObj, TEXT("MovementRemaining"));
-            Entity.SlotId                = GetInt(EntityObj, TEXT("SlotId"));
-            Entity.bIsScrambled          = GetBool(EntityObj, TEXT("bIsScrambled"));
-            Entity.bHasLoadedThisTurn    = GetBool(EntityObj, TEXT("bHasLoadedThisTurn"));
-            Entity.bHasUnloadedThisTurn  = GetBool(EntityObj, TEXT("bHasUnloadedThisTurn"));
-            Entity.bIsSubmerged          = GetBool(EntityObj, TEXT("bIsSubmerged"));
+            Entity.UnitType = GetInt(EntityObj, TEXT("UnitType"));
+            Entity.OwningPlayer = GetInt(EntityObj, TEXT("OwningPlayer"));
+            Entity.Count = FMath::Max(GetInt(EntityObj, TEXT("Count")), 1);
+            Entity.HitPoints = GetInt(EntityObj, TEXT("HitPoints"));
+            Entity.MovementRemaining = GetInt(EntityObj, TEXT("MovementRemaining"));
+            Entity.SlotId = GetInt(EntityObj, TEXT("SlotId"));
+            Entity.bIsScrambled = GetBool(EntityObj, TEXT("bIsScrambled"));
+            Entity.bHasLoadedThisTurn = GetBool(EntityObj, TEXT("bHasLoadedThisTurn"));
+            Entity.bHasUnloadedThisTurn = GetBool(EntityObj, TEXT("bHasUnloadedThisTurn"));
+            Entity.bIsSubmerged = GetBool(EntityObj, TEXT("bIsSubmerged"));
             Entity.CombatEngagementState = GetInt(EntityObj, TEXT("CombatEngagementState"));
-            Entity.bIsRetreating         = GetBool(EntityObj, TEXT("bIsRetreating"));
-            Entity.CargoUnitTypeA        = GetInt(EntityObj, TEXT("CargoUnitTypeA"));
-            Entity.CargoUnitOwnerA       = GetInt(EntityObj, TEXT("CargoUnitOwnerA"));
-            Entity.CargoUnitTypeB        = GetInt(EntityObj, TEXT("CargoUnitTypeB"));
-            Entity.CargoUnitOwnerB       = GetInt(EntityObj, TEXT("CargoUnitOwnerB"));
-            Entity.bIsStrategicBombing          = GetBool(EntityObj, TEXT("bIsStrategicBombing"));
-            Entity.bIsEscorting                 = GetBool(EntityObj, TEXT("bIsEscorting"));
-            Entity.bIsIntercepting              = GetBool(EntityObj, TEXT("bIsIntercepting"));
-            Entity.bIsConductingSurpriseStrike  = GetBool(EntityObj, TEXT("bIsConductingSurpriseStrike"));
-            Entity.IsBombarding                 = GetInt(EntityObj, TEXT("IsBombarding"));
-            Entity.bHasCompletedSurpriseStrike  = GetBool(EntityObj, TEXT("bHasCompletedSurpriseStrike"));
-            Entity.bHasCompletedBombardment     = GetBool(EntityObj, TEXT("bHasCompletedBombardment"));
-            Entity.bIsParatrooper               = GetBool(EntityObj, TEXT("bIsParatrooper"));
-            Entity.StartOfTurnTerritory         = GetInt(EntityObj, TEXT("StartOfTurnTerritory"));
+            Entity.bIsRetreating = GetBool(EntityObj, TEXT("bIsRetreating"));
+            Entity.CargoUnitTypeA = GetInt(EntityObj, TEXT("CargoUnitTypeA"));
+            Entity.CargoUnitOwnerA = GetInt(EntityObj, TEXT("CargoUnitOwnerA"));
+            Entity.CargoUnitTypeB = GetInt(EntityObj, TEXT("CargoUnitTypeB"));
+            Entity.CargoUnitOwnerB = GetInt(EntityObj, TEXT("CargoUnitOwnerB"));
+            Entity.bIsStrategicBombing = GetBool(EntityObj, TEXT("bIsStrategicBombing"));
+            Entity.bIsEscorting = GetBool(EntityObj, TEXT("bIsEscorting"));
+            Entity.bIsIntercepting = GetBool(EntityObj, TEXT("bIsIntercepting"));
+            Entity.bIsConductingSurpriseStrike = GetBool(EntityObj, TEXT("bIsConductingSurpriseStrike"));
+            Entity.IsBombarding = GetInt(EntityObj, TEXT("IsBombarding"));
+            Entity.bHasCompletedSurpriseStrike = GetBool(EntityObj, TEXT("bHasCompletedSurpriseStrike"));
+            Entity.bHasCompletedBombardment = GetBool(EntityObj, TEXT("bHasCompletedBombardment"));
+            Entity.bIsParatrooper = GetBool(EntityObj, TEXT("bIsParatrooper"));
+            Entity.StartOfTurnTerritory = GetInt(EntityObj, TEXT("StartOfTurnTerritory"));
             List.Entities.Add(Entity);
             TotalEntitiesLoaded++;
         }
@@ -5427,4 +5456,13 @@ int32 UAIManager::GetActionFromAIModel(
         });
 
     return -1;
+}
+
+TArray<FTerritoryEntityList> UAIManager::DebugSimulateTransition(
+    const TArray<float>& InState, int32 InPhaseId, int32 InPlayerId, int32 Action,
+    int32 PendingA, int32 PendingB, int32 PendingC, int32 PendingD,
+    const TArray<FTerritoryEntityList>& InEntityLists)
+{
+    return Internal_SimulateTransition(InState, InPhaseId, InPlayerId, Action, true,
+        PendingA, PendingB, PendingC, PendingD, INDEX_NONE, InEntityLists).OutEntityLists;
 }
