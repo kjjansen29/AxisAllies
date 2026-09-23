@@ -783,11 +783,45 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
 
     if (IsChainIntermediatePhase(ParentPhase))
     {
-        // Chain-intermediate: copy state and entity lists forward unchanged.
-        // SimulateTransition is not called — no action applied yet.
-        Child.NodeFeatures = Parent.NodeFeatures;
-        Child.GlobalFeatures = Parent.GlobalFeatures;
-        Child.EntityLists = Parent.EntityLists;
+        // Chain-intermediate phases that change the game state must still
+        // run SimulateTransition, so the next chain step sees the updated
+        // state and entity lists. All other chain-intermediate phases copy
+        // state and entity lists forward unchanged.
+        const bool bSimulateChainStep =
+            Parent.PhaseId == 33 ||
+            Parent.PhaseId == 41;
+
+        if (bSimulateChainStep)
+        {
+            const bool bHasPendingContext = Parent.PendingActionContext.bIsValid;
+
+            const FApplyActionResult StepResult = Internal_SimulateTransition(
+                CombinedState,
+                Parent.PhaseId,
+                Parent.PlayerId,
+                Action,
+                bHasPendingContext,
+                bHasPendingContext ? Parent.PendingActionContext.PendingActionA : INDEX_NONE,
+                bHasPendingContext ? Parent.PendingActionContext.PendingActionB : INDEX_NONE,
+                bHasPendingContext ? Parent.PendingActionContext.PendingActionC : INDEX_NONE,
+                bHasPendingContext ? Parent.PendingActionContext.PendingActionD : INDEX_NONE,
+                NodeIndex,
+                Parent.EntityLists
+            );
+
+            Child.NodeFeatures = ExtractNodeFeatures(StepResult.OutState);
+            Child.GlobalFeatures = ExtractGlobalFeatures(StepResult.OutState);
+            Child.EntityLists = StepResult.OutEntityLists;
+            if (Child.EntityLists.Num() != NUM_TERRITORIES)
+                Child.EntityLists.SetNum(NUM_TERRITORIES);
+        }
+        else
+        {
+            Child.NodeFeatures = Parent.NodeFeatures;
+            Child.GlobalFeatures = Parent.GlobalFeatures;
+            Child.EntityLists = Parent.EntityLists;
+        }
+
         Child.PhaseId = static_cast<int32>(GetNextChainPhase(ParentPhase));
         Child.PlayerId = Parent.PlayerId;
         Child.ParentIndex = NodeIndex;
@@ -1062,13 +1096,6 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
     ChildIndex = Tree.CreateNode(Child);
     Tree.GetNode(NodeIndex).ChildIndices.Add(ChildIndex);
 
-    // TEST: node index of each Phase 19 child, to match against the "Root %d" log.
-    if (ParentPhase == EPhaseId::CombatMoveQuantity)
-    {
-        UE_LOG(LogTemp, Warning,
-            TEXT("Phase19 child created: ParentNode=%d Action=%d -> ChildNode=%d"),
-            NodeIndex, Action, ChildIndex);
-    }
     FMCTSNode& CreatedChild = Tree.GetNode(ChildIndex);
 
     // ----------------------------------------------------------------
