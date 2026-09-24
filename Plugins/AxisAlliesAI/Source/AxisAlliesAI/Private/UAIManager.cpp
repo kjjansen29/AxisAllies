@@ -245,6 +245,21 @@ void UAIManager::BeginMCTS(
         ? Tree.RootIndex
         : INDEX_NONE;
 
+    // A kept tree exists but cannot be reused: log why a new root is built.
+    if (ExistingRoot == INDEX_NONE && Tree.Nodes.IsValidIndex(Tree.RootIndex))
+    {
+        const FMCTSNode& KeptRoot = Tree.GetNode(Tree.RootIndex);
+        const FString Msg = FString::Printf(
+            TEXT("NEW ROOT BUILT: requested Phase=%d Player=%d, kept root Phase=%d Player=%d A=%d B=%d C=%d D=%d"),
+            PhaseId, PlayerId,
+            KeptRoot.PhaseId, KeptRoot.PlayerId,
+            KeptRoot.PendingActionContext.PendingActionA,
+            KeptRoot.PendingActionContext.PendingActionB,
+            KeptRoot.PendingActionContext.PendingActionC,
+            KeptRoot.PendingActionContext.PendingActionD);
+        UE_LOG(LogTemp, Warning, TEXT("%s"), *Msg);
+    }
+
     // ----------------------------------------------------------------
     // Per-simulation state for the pending-set batched MCTS
     // ----------------------------------------------------------------
@@ -791,11 +806,13 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             Parent.PhaseId == 33 ||
             Parent.PhaseId == 41;
 
+        FApplyActionResult StepResult;
+
         if (bSimulateChainStep)
         {
             const bool bHasPendingContext = Parent.PendingActionContext.bIsValid;
 
-            const FApplyActionResult StepResult = Internal_SimulateTransition(
+            StepResult = Internal_SimulateTransition(
                 CombinedState,
                 Parent.PhaseId,
                 Parent.PlayerId,
@@ -821,7 +838,6 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             Child.GlobalFeatures = Parent.GlobalFeatures;
             Child.EntityLists = Parent.EntityLists;
         }
-
         Child.PhaseId = static_cast<int32>(GetNextChainPhase(ParentPhase));
         Child.PlayerId = Parent.PlayerId;
         Child.ParentIndex = NodeIndex;
@@ -893,25 +909,34 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             Child.PendingActionContext.bIsValid = true;
         }
 
-        TArray<float> ChainState;
-        ChainState.Reserve(Child.NodeFeatures.Num() + Child.GlobalFeatures.Num());
-        ChainState.Append(Child.NodeFeatures);
-        ChainState.Append(Child.GlobalFeatures);
+        if (bSimulateChainStep)
+        {
+            // SimulateTransition already returned the next phase's mask.
+            Child.LegalActionMask = StepResult.OutLegalActionMask;
+            Child.bIsTerminal = StepResult.bIsTerminal;
+        }
+        else
+        {
+            TArray<float> ChainState;
+            ChainState.Reserve(Child.NodeFeatures.Num() + Child.GlobalFeatures.Num());
+            ChainState.Append(Child.NodeFeatures);
+            ChainState.Append(Child.GlobalFeatures);
 
-        const FApplyActionResult MaskResult = Internal_GetLegalActionMask(
-            ChainState,
-            Child.PhaseId,
-            Child.PlayerId,
-            true,
-            Child.PendingActionContext.PendingActionA,
-            Child.PendingActionContext.PendingActionB,
-            Child.PendingActionContext.PendingActionC,
-            Child.PendingActionContext.PendingActionD,
-            NodeIndex,
-            Child.EntityLists
-        );
-        Child.LegalActionMask = MaskResult.OutLegalActionMask;
-        Child.bIsTerminal = MaskResult.bIsTerminal;
+            const FApplyActionResult MaskResult = Internal_GetLegalActionMask(
+                ChainState,
+                Child.PhaseId,
+                Child.PlayerId,
+                true,
+                Child.PendingActionContext.PendingActionA,
+                Child.PendingActionContext.PendingActionB,
+                Child.PendingActionContext.PendingActionC,
+                Child.PendingActionContext.PendingActionD,
+                NodeIndex,
+                Child.EntityLists
+            );
+            Child.LegalActionMask = MaskResult.OutLegalActionMask;
+            Child.bIsTerminal = MaskResult.bIsTerminal;
+        }
     }
     else
     {
@@ -2077,7 +2102,12 @@ int32 UAIManager::GetActionFromMCTS(
     const TArray<FTerritoryEntityList>& InEntityLists)
 {
     if (!InGameState || GameState.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("MCTS -1: InGameState null or GameState empty, Phase=%d (no broadcast)"),
+            PhaseId);
         return -1;
+    }
 
     if (bMCTSRunning)
     {
@@ -2105,6 +2135,8 @@ int32 UAIManager::GetActionFromMCTS(
 
             if (!GameStateRef_.IsValid())
             {
+                UE_LOG(LogTemp, Error,
+                    TEXT("MCTS -1: GameStateRef invalid, Phase=%d"), PhaseIdCopy);
                 bMCTSRunning = false;
                 AsyncTask(ENamedThreads::GameThread, [this]()
                     {
@@ -2134,6 +2166,8 @@ int32 UAIManager::GetActionFromMCTS(
             const int32 RootIndex = Tree.RootIndex;
             if (RootIndex == INDEX_NONE || !Tree.Nodes.IsValidIndex(RootIndex))
             {
+                UE_LOG(LogTemp, Error,
+                    TEXT("MCTS -1: no valid root after BeginMCTS, Phase=%d"), PhaseIdCopy);
                 ResetMCTS();
                 bMCTSRunning = false;
                 AsyncTask(ENamedThreads::GameThread, [this]()
@@ -2146,6 +2180,17 @@ int32 UAIManager::GetActionFromMCTS(
             const float Temperature = GetMCTSTemperature();
             Action = SelectFinalActionFromVisits(RootIndex, Temperature);
 
+            if (Action < 0)
+            {
+                const FMCTSNode& R = Tree.GetNode(RootIndex);
+                int32 LegalCount = 0;
+                for (bool bLegal : R.LegalActionMask) if (bLegal) LegalCount++;
+                UE_LOG(LogTemp, Error,
+                    TEXT("MCTS -1: no action selected, Phase=%d A=%d Terminal=%d PolicyInit=%d MaskLen=%d LegalActions=%d"),
+                    PhaseIdCopy, R.PendingActionContext.PendingActionA, R.bIsTerminal,
+                    R.bPolicyInitialized, R.LegalActionMask.Num(), LegalCount);
+            }
+
             FinalizeMCTS();
 
             if (Tree.Nodes.IsValidIndex(RootIndex))
@@ -2155,27 +2200,55 @@ int32 UAIManager::GetActionFromMCTS(
             }
 
             const bool bValidAction = (Action >= 0);
-            if (bValidAction && Tree.Nodes.IsValidIndex(RootIndex))
+            if (bValidAction)
             {
-                const bool bAlreadySampled =
-                    (LastSampledActionRootIndex == RootIndex);
-                if (!bAlreadySampled)
-                {
-                    UAI_ReplayBufferManager::Get().StoreSelfPlaySample(Tree);
-                    LastSampledActionRootIndex = RootIndex;
-                    bHasEmittedRootSampleThisStep = true;
-                    CurrentGameSampleCount++;
+                FString SkipReason;
 
-                    // Flush to disk every 50 samples to keep memory usage low
-                    if (UAI_ReplayBufferManager::Get().GetSamplesInMemory() >=
-                        ReplayBufferFlushThreshold)
+                if (!Tree.Nodes.IsValidIndex(RootIndex))
+                {
+                    SkipReason = TEXT("tree was reset by FinalizeMCTS");
+                }
+                else
+                {
+                    const int32 CountBefore =
+                        UAI_ReplayBufferManager::Get().GetSampleCount();
+
+                    UAI_ReplayBufferManager::Get().StoreSelfPlaySample(Tree);
+
+                    if (UAI_ReplayBufferManager::Get().GetSampleCount() == CountBefore)
                     {
-                        UAI_ReplayBufferManager::Get().FlushPartialToDisk();
-                        AsyncTask(ENamedThreads::GameThread, [this]()
-                            {
-                                OnSamplesFlushed.Broadcast();
-                            });
+                        SkipReason = TEXT("rejected by StoreSelfPlaySample");
                     }
+                    else
+                    {
+                        LastSampledActionRootIndex = RootIndex;
+                        bHasEmittedRootSampleThisStep = true;
+                        CurrentGameSampleCount++;
+
+                        // Flush to disk every 50 samples to keep memory usage low
+                        if (UAI_ReplayBufferManager::Get().GetSamplesInMemory() >=
+                            ReplayBufferFlushThreshold)
+                        {
+                            UAI_ReplayBufferManager::Get().FlushPartialToDisk();
+                            AsyncTask(ENamedThreads::GameThread, [this]()
+                                {
+                                    OnSamplesFlushed.Broadcast();
+                                });
+                        }
+                    }
+                }
+
+                if (!SkipReason.IsEmpty())
+                {
+                    const FString Msg = FString::Printf(
+                        TEXT("SAMPLE NOT STORED: Phase=%d Action=%d Reason=%s"),
+                        PhaseIdCopy, Action, *SkipReason);
+                    UE_LOG(LogTemp, Warning, TEXT("%s"), *Msg);
+                    AsyncTask(ENamedThreads::GameThread, [Msg]()
+                        {
+                            if (GEngine)
+                                GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, Msg);
+                        });
                 }
             }
 
@@ -2812,11 +2885,26 @@ void UAIManager::ValidatePhaseRoutingInvariant(int32 NodeIndex)
             Node.PolicyPrior.Num() == ExpectedActionSize,
             TEXT("PolicyPrior size mismatch NodeIndex %d"), NodeIndex);
     }
-    if (Node.LegalActionMask.Num() > 0)
+
+    // Fires only when a node has a legal action mask whose length does not
+    // match the action space of its own phase.
+    if (Node.LegalActionMask.Num() > 0 &&
+        Node.LegalActionMask.Num() != ExpectedActionSize)
     {
-        ensureMsgf(
-            Node.LegalActionMask.Num() == ExpectedActionSize,
-            TEXT("LegalActionMask size mismatch NodeIndex %d"), NodeIndex);
+        const int32 ParentPhase =
+            Tree.Nodes.IsValidIndex(Node.ParentIndex)
+            ? Tree.GetNode(Node.ParentIndex).PhaseId
+            : INDEX_NONE;
+
+        const FString Msg = FString::Printf(
+            TEXT("LegalActionMask size mismatch: NodeIndex=%d Phase=%d MaskLen=%d Expected=%d IsRoot=%d ParentIndex=%d ParentPhase=%d ActionFromParent=%d"),
+            NodeIndex, Node.PhaseId, Node.LegalActionMask.Num(), ExpectedActionSize,
+            NodeIndex == Tree.RootIndex ? 1 : 0,
+            Node.ParentIndex, ParentPhase, Node.ActionFromParent);
+
+        // Logged every time it happens (the ensure below only fires once per session).
+        UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+        ensureMsgf(false, TEXT("%s"), *Msg);
     }
 }
 
