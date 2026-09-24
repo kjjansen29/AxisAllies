@@ -245,19 +245,63 @@ void UAIManager::BeginMCTS(
         ? Tree.RootIndex
         : INDEX_NONE;
 
-    // A kept tree exists but cannot be reused: log why a new root is built.
+    // A kept tree exists but cannot be reused: log why a new root is built,
+    // and whether the kept root's simulated state matches the real state.
     if (ExistingRoot == INDEX_NONE && Tree.Nodes.IsValidIndex(Tree.RootIndex))
     {
         const FMCTSNode& KeptRoot = Tree.GetNode(Tree.RootIndex);
-        const FString Msg = FString::Printf(
-            TEXT("NEW ROOT BUILT: requested Phase=%d Player=%d, kept root Phase=%d Player=%d A=%d B=%d C=%d D=%d"),
+
+        // Compare game state (node features + global features).
+        TArray<float> KeptState = KeptRoot.NodeFeatures;
+        KeptState.Append(KeptRoot.GlobalFeatures);
+        int32 StateDiffs = 0;
+        int32 FirstStateDiff = INDEX_NONE;
+        const int32 StateLen = FMath::Max(KeptState.Num(), GameState.Num());
+        for (int32 i = 0; i < StateLen; i++)
+        {
+            const bool bSame = KeptState.IsValidIndex(i) && GameState.IsValidIndex(i) &&
+                FMath::IsNearlyEqual(KeptState[i], GameState[i], 1e-6f);
+            if (!bSame)
+            {
+                StateDiffs++;
+                if (FirstStateDiff == INDEX_NONE) FirstStateDiff = i;
+            }
+        }
+
+        // Compare entity lists (count and every entity's features, in order).
+        int32 TerritoryDiffs = 0;
+        int32 FirstTerritoryDiff = INDEX_NONE;
+        for (int32 t = 0; t < NUM_TERRITORIES; t++)
+        {
+            const int32 KeptNum = KeptRoot.EntityLists.IsValidIndex(t)
+                ? KeptRoot.EntityLists[t].Entities.Num() : 0;
+            const int32 RealNum = InEntityLists.IsValidIndex(t)
+                ? InEntityLists[t].Entities.Num() : 0;
+            bool bSame = (KeptNum == RealNum);
+            for (int32 e = 0; bSame && e < KeptNum; e++)
+            {
+                float KF[UNIT_ENTITY_FEATURE_COUNT] = {};
+                float RF[UNIT_ENTITY_FEATURE_COUNT] = {};
+                KeptRoot.EntityLists[t].Entities[e].ToModelFeatures(KF);
+                InEntityLists[t].Entities[e].ToModelFeatures(RF);
+                bSame = FMemory::Memcmp(KF, RF, sizeof(KF)) == 0;
+            }
+            if (!bSame)
+            {
+                TerritoryDiffs++;
+                if (FirstTerritoryDiff == INDEX_NONE) FirstTerritoryDiff = t;
+            }
+        }
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("NEW ROOT BUILT: requested Phase=%d Player=%d, kept root Phase=%d Player=%d A=%d B=%d C=%d D=%d | StateDiffs=%d FirstStateIndex=%d | TerritoryDiffs=%d FirstTerritory=%d"),
             PhaseId, PlayerId,
             KeptRoot.PhaseId, KeptRoot.PlayerId,
             KeptRoot.PendingActionContext.PendingActionA,
             KeptRoot.PendingActionContext.PendingActionB,
             KeptRoot.PendingActionContext.PendingActionC,
-            KeptRoot.PendingActionContext.PendingActionD);
-        UE_LOG(LogTemp, Warning, TEXT("%s"), *Msg);
+            KeptRoot.PendingActionContext.PendingActionD,
+            StateDiffs, FirstStateDiff, TerritoryDiffs, FirstTerritoryDiff);
     }
 
     // ----------------------------------------------------------------
@@ -5134,7 +5178,7 @@ void UAIManager::AssembleEntityTensor(
 {
     const int32 N = NUM_TERRITORIES;
     const int32 E = MAX_UNIT_ENTITIES_PER_NODE;
-    const int32 F = UNIT_ENTITY_FEATURE_COUNT;  // 24
+    const int32 F = UNIT_ENTITY_FEATURE_COUNT;  // 25
 
     OutEntityTensor.Init(0.0f, N * E * F);
     OutEntityCounts.Init(0.0f, N);
@@ -5148,7 +5192,7 @@ void UAIManager::AssembleEntityTensor(
 
         for (int32 e = 0; e < Count; e++)
         {
-            float Features[24];
+            float Features[UNIT_ENTITY_FEATURE_COUNT] = {};
             List.Entities[e].ToModelFeatures(Features);
             const int32 Offset = (t * E + e) * F;
             FMemory::Memcpy(

@@ -216,7 +216,7 @@ void UAI_ReplayBufferManager::SerializeEntityList(
 
             for (const FUnitEntity& Entity : TList.Entities)
             {
-                float Features[UNIT_ENTITY_FEATURE_COUNT];
+                float Features[UNIT_ENTITY_FEATURE_COUNT] = {};
                 Entity.ToModelFeatures(Features);
 
                 TArray<TSharedPtr<FJsonValue>> FeatJson;
@@ -698,6 +698,11 @@ bool UAI_ReplayBufferManager::ApplyOutcomeValuesToEpisode(
             Sample.ValueTarget[p] = OutcomeValues[p];
     }
 
+    // ---- Drop invalid samples so the new-sample counter only counts
+    //      samples that will actually be saved ----
+    StagingBuffer.RemoveAll([this](const FMCTSTrainingSample& S)
+        { return !IsValidTrainingSample(S); });
+
     // ---- Append corrected samples directly to TotalReplayBuffer ----
     TArray<FMCTSTrainingSample> TotalBuffer = LoadTotalBufferFromDisk();
     TotalBuffer.Append(StagingBuffer);
@@ -760,7 +765,12 @@ bool UAI_ReplayBufferManager::ExportReplayBuffer(
 
     // ----------------------------------------------------------------
     // STEP 3: MERGE IN-MEMORY BUFFER INTO TOTAL BUFFER
+    // Invalid samples are dropped first so the new-sample counter
+    // only counts samples that will actually be saved.
     // ----------------------------------------------------------------
+    Buffer.RemoveAll([this](const FMCTSTrainingSample& S)
+        { return !IsValidTrainingSample(S); });
+
     if (Buffer.Num() > 0)
     {
         TotalBuffer.Append(Buffer);
@@ -776,17 +786,12 @@ bool UAI_ReplayBufferManager::ExportReplayBuffer(
 
     // ----------------------------------------------------------------
     // STEP 5: VALIDATE
+    // Iterate backwards so removals never skip or invalidate elements.
     // ----------------------------------------------------------------
-    for (const FMCTSTrainingSample& Sample : TotalBuffer)
+    for (int32 i = TotalBuffer.Num() - 1; i >= 0; i--)
     {
-        if (!IsValidTrainingSample(Sample))
-        {
-            for (int32 i = TotalBuffer.Num() - 1; i >= 0; i--)
-            {
-                if (!IsValidTrainingSample(TotalBuffer[i]))
-                    TotalBuffer.RemoveAt(i);
-            }
-        }
+        if (!IsValidTrainingSample(TotalBuffer[i]))
+            TotalBuffer.RemoveAt(i);
     }
 
     // ----------------------------------------------------------------
