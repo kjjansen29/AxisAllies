@@ -1,6 +1,7 @@
 ﻿#include "UAI_RDGCache.h"
 #include "NNE.h"
 #include "NNERuntimeRDG.h"
+#include "NNERuntimeCPU.h"
 #include "AIInferenceSpec.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -10,15 +11,12 @@
 #include "RHIUtilities.h"
 #include "RenderGraphValidation.h"
 
-#pragma once
-
 namespace
 {
     FCriticalSection GModelSwapMutex;
-    bool    bPendingModelSwap = false;
-    FString PendingONNXPath;
-    FString PendingPTPath;
 }
+
+UAI_RDGCache::FInferenceTimingStats UAI_RDGCache::TimingStats;
 
 bool UAI_RDGCache::Initialize(const FString& RuntimeName)
 {
@@ -27,7 +25,7 @@ bool UAI_RDGCache::Initialize(const FString& RuntimeName)
     if (!FPaths::FileExists(ONNXPath))
     {
         ensureMsgf(false,
-            TEXT("RDG Initialize failed: ONNX model not found at %s"), *ONNXPath);
+            TEXT("Inference Initialize failed: ONNX model not found at %s"), *ONNXPath);
         return false;
     }
 
@@ -35,45 +33,218 @@ bool UAI_RDGCache::Initialize(const FString& RuntimeName)
     if (!ModelData)
     {
         ensureMsgf(false,
-            TEXT("RDG Initialize failed: could not load ModelData from %s"), *ONNXPath);
+            TEXT("Inference Initialize failed: could not load ModelData from %s"), *ONNXPath);
         return false;
     }
 
-    TWeakInterfacePtr<INNERuntimeRDG> Runtime =
-        UE::NNE::GetRuntime<INNERuntimeRDG>(RuntimeName);
-    if (!Runtime.IsValid())
+    bUseCPU = RuntimeName.EndsWith(TEXT("Cpu"));
+
+    const bool bOk = bUseCPU
+        ? RebuildCPUModelFromData(ModelData)
+        : RebuildRDGModelFromData(ModelData);
+
+    if (!bOk)
     {
-        ensureMsgf(false,
-            TEXT("RDG Initialize failed: invalid runtime %s"), *RuntimeName);
+        ensureMsgf(false, TEXT("Inference Initialize failed for runtime %s"), *RuntimeName);
         return false;
     }
 
-    ModelRDG = ModelRDG = Runtime->CreateModelRDG(ModelData);
-    if (!ModelRDG.IsValid())
-    {
-        ensureMsgf(false, TEXT("RDG Initialize failed: CreateModelRDG failed"));
-        return false;
-    }
-
-    ModelInstance = ModelRDG->CreateModelInstanceRDG();
-    if (!ModelInstance.IsValid())
-    {
-        ensureMsgf(false,
-            TEXT("RDG Initialize failed: CreateModelInstanceRDG failed"));
-        return false;
-    }
-
+    bModelInitialized = true;
+    UE_LOG(LogTemp, Log, TEXT("Inference initialized with runtime %s"), *RuntimeName);
     return true;
 }
 
 void UAI_RDGCache::Reset()
 {
-    ModelInstance.Reset();
-    ModelRDG.Reset();
+    ReleaseCurrentModel();
     LastBatchSize = -1;
 }
 
+// ----------------------------------------------------------------
+// RunInference — forwards to the CPU or GPU path chosen in Initialize.
+// ----------------------------------------------------------------
 bool UAI_RDGCache::RunInference(
+    const TArray<TArray<float>>& NodeFeaturesBatch,
+    const TArray<TArray<float>>& GlobalFeaturesBatch,
+    const TArray<TArray<float>>& EntityTensorBatch,
+    const TArray<TArray<float>>& EntityCountsBatch,
+    const TArray<float>& PhaseIds,
+    TArray<float>& OutHead2,
+    TArray<float>& OutHead3,
+    TArray<float>& OutHead7,
+    TArray<float>& OutHead10,
+    TArray<float>& OutHead13,
+    TArray<float>& OutHead14,
+    TArray<float>& OutHead20,
+    TArray<float>& OutHead49,
+    TArray<float>& OutHead128,
+    TArray<float>& OutHead202,
+    TArray<float>& OutHead330,
+    TArray<float>& OutHead6581,
+    TArray<float>& OutHead988,
+    TArray<float>& OutValue)
+{
+    if (bUseCPU)
+    {
+        return RunInferenceCPU(
+            NodeFeaturesBatch, GlobalFeaturesBatch, EntityTensorBatch, EntityCountsBatch, PhaseIds,
+            OutHead2, OutHead3, OutHead7, OutHead10, OutHead13, OutHead14, OutHead20,
+            OutHead49, OutHead128, OutHead202, OutHead330, OutHead6581, OutHead988, OutValue);
+    }
+    return RunInferenceGPU(
+        NodeFeaturesBatch, GlobalFeaturesBatch, EntityTensorBatch, EntityCountsBatch, PhaseIds,
+        OutHead2, OutHead3, OutHead7, OutHead10, OutHead13, OutHead14, OutHead20,
+        OutHead49, OutHead128, OutHead202, OutHead330, OutHead6581, OutHead988, OutValue);
+}
+
+// ----------------------------------------------------------------
+// RunInferenceCPU
+// Runs the model synchronously on the calling thread (the search thread).
+// No game-thread, render-thread or GPU synchronization.
+// ----------------------------------------------------------------
+bool UAI_RDGCache::RunInferenceCPU(
+    const TArray<TArray<float>>& NodeFeaturesBatch,
+    const TArray<TArray<float>>& GlobalFeaturesBatch,
+    const TArray<TArray<float>>& EntityTensorBatch,
+    const TArray<TArray<float>>& EntityCountsBatch,
+    const TArray<float>& PhaseIds,
+    TArray<float>& OutHead2, TArray<float>& OutHead3, TArray<float>& OutHead7,
+    TArray<float>& OutHead10, TArray<float>& OutHead13, TArray<float>& OutHead14,
+    TArray<float>& OutHead20, TArray<float>& OutHead49, TArray<float>& OutHead128,
+    TArray<float>& OutHead202, TArray<float>& OutHead330, TArray<float>& OutHead6581,
+    TArray<float>& OutHead988, TArray<float>& OutValue)
+{
+    FScopeLock Lock(&CPUInferenceMutex);
+
+    if (!ModelInstanceCPU.IsValid())
+        return false;
+
+    const int32 BatchSize = PhaseIds.Num();
+    const int32 NodeFlatSize = NUM_TERRITORIES * NODE_FEATURE_COUNT;
+    const int32 EntityFlatSize =
+        NUM_TERRITORIES * MAX_UNIT_ENTITIES_PER_NODE * UNIT_ENTITY_FEATURE_COUNT;
+
+    if (BatchSize <= 0 ||
+        NodeFeaturesBatch.Num() != BatchSize ||
+        GlobalFeaturesBatch.Num() != BatchSize ||
+        EntityTensorBatch.Num() != BatchSize ||
+        EntityCountsBatch.Num() != BatchSize)
+    {
+        ensureMsgf(false, TEXT("RunInferenceCPU: invalid batch input sizes"));
+        return false;
+    }
+
+    // ---- Flatten inputs (every row must have its exact size) ----
+    TArray<float> FlatNode, FlatGlobal, FlatEntity, FlatCounts;
+    FlatNode.Reserve(BatchSize * NodeFlatSize);
+    FlatGlobal.Reserve(BatchSize * GLOBAL_FEATURE_COUNT);
+    FlatEntity.Reserve(BatchSize * EntityFlatSize);
+    FlatCounts.Reserve(BatchSize * NUM_TERRITORIES);
+
+    for (int32 i = 0; i < BatchSize; i++)
+    {
+        if (NodeFeaturesBatch[i].Num() != NodeFlatSize ||
+            GlobalFeaturesBatch[i].Num() != GLOBAL_FEATURE_COUNT)
+        {
+            ensureMsgf(false, TEXT("RunInferenceCPU: bad feature size in batch row %d"), i);
+            return false;
+        }
+        FlatNode.Append(NodeFeaturesBatch[i]);
+        FlatGlobal.Append(GlobalFeaturesBatch[i]);
+
+        // Empty entity data is allowed (treated as no units).
+        if (EntityTensorBatch[i].Num() == EntityFlatSize)
+            FlatEntity.Append(EntityTensorBatch[i]);
+        else
+            FlatEntity.AddZeroed(EntityFlatSize);
+
+        if (EntityCountsBatch[i].Num() == NUM_TERRITORIES)
+            FlatCounts.Append(EntityCountsBatch[i]);
+        else
+            FlatCounts.AddZeroed(NUM_TERRITORIES);
+    }
+
+    // ---- Input shapes (only when the batch size changes) ----
+    if (CPUShapeBatchSize != BatchSize)
+    {
+        TArray<UE::NNE::FTensorShape> InputShapes;
+        InputShapes.Add(UE::NNE::FTensorShape::Make({
+            (uint32)BatchSize, (uint32)NUM_TERRITORIES, (uint32)NODE_FEATURE_COUNT }));
+        InputShapes.Add(UE::NNE::FTensorShape::Make({
+            (uint32)BatchSize, (uint32)GLOBAL_FEATURE_COUNT }));
+        InputShapes.Add(UE::NNE::FTensorShape::Make({
+            (uint32)BatchSize, (uint32)NUM_TERRITORIES,
+            (uint32)MAX_UNIT_ENTITIES_PER_NODE, (uint32)UNIT_ENTITY_FEATURE_COUNT }));
+        InputShapes.Add(UE::NNE::FTensorShape::Make({
+            (uint32)BatchSize, (uint32)NUM_TERRITORIES, 1u }));
+
+        if (ModelInstanceCPU->SetInputTensorShapes(InputShapes) != UE::NNE::EResultStatus::Ok)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("RunInferenceCPU: SetInputTensorShapes failed for BatchSize=%d"), BatchSize);
+            CPUShapeBatchSize = -1;
+            return false;
+        }
+        CPUShapeBatchSize = BatchSize;
+    }
+
+    // ---- Outputs, in model.py order: HEAD_NAMES + ["value"] ----
+    OutHead2.SetNumUninitialized(BatchSize * PolicyHeadSize::Head2);
+    OutHead3.SetNumUninitialized(BatchSize * PolicyHeadSize::Head3);
+    OutHead7.SetNumUninitialized(BatchSize * PolicyHeadSize::Head7);
+    OutHead10.SetNumUninitialized(BatchSize * PolicyHeadSize::Head10);
+    OutHead13.SetNumUninitialized(BatchSize * PolicyHeadSize::Head13);
+    OutHead14.SetNumUninitialized(BatchSize * PolicyHeadSize::Head14);
+    OutHead20.SetNumUninitialized(BatchSize * PolicyHeadSize::Head20);
+    OutHead49.SetNumUninitialized(BatchSize * PolicyHeadSize::Head49);
+    OutHead128.SetNumUninitialized(BatchSize * PolicyHeadSize::Head128);
+    OutHead202.SetNumUninitialized(BatchSize * PolicyHeadSize::Head202);
+    OutHead330.SetNumUninitialized(BatchSize * PolicyHeadSize::Head330);
+    OutHead6581.SetNumUninitialized(BatchSize * PolicyHeadSize::Head6581);
+    OutHead988.SetNumUninitialized(BatchSize * PolicyHeadSize::Head988);
+    OutValue.SetNumUninitialized(BatchSize * NUM_PLAYERS);
+
+    auto Bind = [](TArray<float>& A) -> UE::NNE::FTensorBindingCPU
+        {
+            return UE::NNE::FTensorBindingCPU{ A.GetData(), (uint64)A.Num() * sizeof(float) };
+        };
+
+    TArray<UE::NNE::FTensorBindingCPU> Inputs;
+    Inputs.Add(Bind(FlatNode));
+    Inputs.Add(Bind(FlatGlobal));
+    Inputs.Add(Bind(FlatEntity));
+    Inputs.Add(Bind(FlatCounts));
+
+    TArray<UE::NNE::FTensorBindingCPU> Outputs;
+    Outputs.Add(Bind(OutHead2));
+    Outputs.Add(Bind(OutHead3));
+    Outputs.Add(Bind(OutHead7));
+    Outputs.Add(Bind(OutHead10));
+    Outputs.Add(Bind(OutHead13));
+    Outputs.Add(Bind(OutHead14));
+    Outputs.Add(Bind(OutHead20));
+    Outputs.Add(Bind(OutHead49));
+    Outputs.Add(Bind(OutHead128));
+    Outputs.Add(Bind(OutHead202));
+    Outputs.Add(Bind(OutHead330));
+    Outputs.Add(Bind(OutHead6581));
+    Outputs.Add(Bind(OutHead988));
+    Outputs.Add(Bind(OutValue));
+
+    if (ModelInstanceCPU->RunSync(Inputs, Outputs) != UE::NNE::EResultStatus::Ok)
+    {
+        UE_LOG(LogTemp, Error, TEXT("RunInferenceCPU: RunSync failed (BatchSize=%d)"), BatchSize);
+        return false;
+    }
+
+    LastBatchSize = BatchSize;
+    return true;
+}
+
+// ----------------------------------------------------------------
+// RunInferenceGPU — GPU (DirectML) path through the render graph.
+// ----------------------------------------------------------------
+bool UAI_RDGCache::RunInferenceGPU(
     const TArray<TArray<float>>& NodeFeaturesBatch,
     const TArray<TArray<float>>& GlobalFeaturesBatch,
     const TArray<TArray<float>>& EntityTensorBatch,
@@ -96,6 +267,8 @@ bool UAI_RDGCache::RunInference(
 {
     if (!ModelInstance.IsValid())
         return false;
+
+    const double PrepStart = FPlatformTime::Seconds();
 
     const int32 BatchSize = PhaseIds.Num();
     if (BatchSize <= 0 ||
@@ -163,6 +336,16 @@ bool UAI_RDGCache::RunInference(
     for (const TArray<float>& Row : EntityCountsBatch)
         FlatEntityCounts.Append(Row);
 
+    // Stage timestamps, filled on the game and render threads.
+    struct FStageTimes
+    {
+        double Posted = 0.0;        // work handed to the game thread
+        double Started = 0.0;       // game thread began the work
+        double AfterUpload = 0.0;   // first flush finished
+        double AfterExecute = 0.0;  // second flush finished
+    };
+    FStageTimes Times;
+
     struct FNNEBuffers
     {
         TRefCountPtr<FRDGPooledBuffer> Node, Global, Entity, Counts;
@@ -170,6 +353,8 @@ bool UAI_RDGCache::RunInference(
         TRefCountPtr<FRDGPooledBuffer> H20, H49, H128, H202;
         TRefCountPtr<FRDGPooledBuffer> H330, H6581, H988, Value;
         bool bShapesSet = false;
+        bool bOutputsRead = false;   // true only when every output was read back
+        double ReadbackSeconds = 0.0;
     };
 
     TSharedPtr<FNNEBuffers>                    Bufs = MakeShared<FNNEBuffers>();
@@ -183,6 +368,8 @@ bool UAI_RDGCache::RunInference(
     // ----------------------------------------------------------------
     auto DoRenderWork = [&]()
         {
+            Times.Started = FPlatformTime::Seconds();
+
             ENQUEUE_RENDER_COMMAND(AAI_AllocNNEBuffers)(
                 [
                     CapturedInstance, Bufs,
@@ -282,6 +469,7 @@ bool UAI_RDGCache::RunInference(
                 });
 
             FlushRenderingCommands();
+            Times.AfterUpload = FPlatformTime::Seconds();
 
             TArray<float>* pH2 = &OutHead2;
             TArray<float>* pH3 = &OutHead3;
@@ -358,6 +546,7 @@ bool UAI_RDGCache::RunInference(
                             RHICmdList.UnlockBuffer(Buf->GetRHI());
                         };
 
+                    const double ReadbackStart = FPlatformTime::Seconds();
                     ReadBack(Bufs->H2, pH2, S2);
                     ReadBack(Bufs->H3, pH3, S3);
                     ReadBack(Bufs->H7, pH7, S7);
@@ -372,14 +561,21 @@ bool UAI_RDGCache::RunInference(
                     ReadBack(Bufs->H6581, pH6581, S6581);
                     ReadBack(Bufs->H988, pH988, S988);
                     ReadBack(Bufs->Value, pVal, SVal);
+
+                    Bufs->ReadbackSeconds = FPlatformTime::Seconds() - ReadbackStart;
+                    Bufs->bOutputsRead = true;
                 });
 
             FlushRenderingCommands();
+            Times.AfterExecute = FPlatformTime::Seconds();
         };
+
+    const double PrepSeconds = FPlatformTime::Seconds() - PrepStart;
 
     // ----------------------------------------------------------------
     // Execute render work on game thread if called from background thread
     // ----------------------------------------------------------------
+    Times.Posted = FPlatformTime::Seconds();
     if (IsInGameThread())
     {
         DoRenderWork();
@@ -399,7 +595,17 @@ bool UAI_RDGCache::RunInference(
     }
 
     LastBatchSize = BatchSize;
-    return true;
+
+    TimingStats.PrepSeconds += PrepSeconds;
+    TimingStats.GameThreadWaitSeconds += Times.Started - Times.Posted;
+    TimingStats.UploadSeconds += Times.AfterUpload - Times.Started;
+    TimingStats.ExecuteSeconds +=
+        (Times.AfterExecute - Times.AfterUpload) - Bufs->ReadbackSeconds;
+    TimingStats.ReadbackSeconds += Bufs->ReadbackSeconds;
+
+    // Outputs are only valid if shapes were set, the graph was enqueued,
+    // and every buffer was read back.
+    return Bufs->bOutputsRead;
 }
 
 bool UAI_RDGCache::RequestModelSwap(
@@ -419,6 +625,10 @@ bool UAI_RDGCache::RequestModelSwap(
         ensureMsgf(false, TEXT("RDG swap blocked: invalid artifact signature."));
         return false;
     }
+
+    // Called from the training thread; TickModelHotSwap reads these on the
+    // game thread.
+    FScopeLock Lock(&GModelSwapMutex);
 
     const bool bHasAcceptedArtifact =
         !LastAcceptedArtifactSignature.UnifiedVersionHash.IsEmpty();
@@ -506,39 +716,69 @@ bool UAI_RDGCache::ApplyModelSwap(const FString& InPendingONNXPath)
 
     ReleaseCurrentModel();
 
-    if (!RebuildRDGModelFromData(LoadedModelData))
+    const bool bRebuilt = bUseCPU
+        ? RebuildCPUModelFromData(LoadedModelData)
+        : RebuildRDGModelFromData(LoadedModelData);
+    if (!bRebuilt)
         return false;
 
     PendingONNXPath = InPendingONNXPath;
     return true;
 }
 
+// ----------------------------------------------------------------
+// TickModelHotSwap
+// Call on the game thread while no inference is running (UAIManager
+// calls it at the start of GetActionFromMCTS / GetActionFromAIModel).
+// Loads the pending model and keeps it active.
+// ----------------------------------------------------------------
 void UAI_RDGCache::TickModelHotSwap()
 {
     if (!bPendingModelSwap)
         return;
 
+    auto ClearPending = [this]()
+        {
+            FScopeLock Lock(&GModelSwapMutex);
+            PendingArtifactSignature = FModelArtifactSignature();
+            PendingONNXPath.Reset();
+            PendingPTPath.Reset();
+            bPendingModelSwap = false;
+        };
+
     if (!ValidatePendingModelSwap())
-        return;
-
-    if (ModelInstance.IsValid() && LastBatchSize > 0)
-        return;
-
-    const bool bSwapApplied = ApplyModelSwap(PendingONNXPath);
-    if (!bSwapApplied)
     {
-        ensureMsgf(false, TEXT("RDG swap failed during ApplyModelSwap."));
+        // Drop an invalid request instead of retrying it on every call.
+        ClearPending();
         return;
     }
 
-    LastAcceptedArtifactSignature = PendingArtifactSignature;
-    PendingArtifactSignature = FModelArtifactSignature();
-    PendingONNXPath.Reset();
-    PendingPTPath.Reset();
-    bPendingModelSwap = false;
+    FString SwapONNXPath;
+    FModelArtifactSignature SwapSignature;
+    {
+        FScopeLock Lock(&GModelSwapMutex);
+        SwapONNXPath = PendingONNXPath;
+        SwapSignature = PendingArtifactSignature;
+    }
 
-    FlushInferenceGraph();
-    ResetInferenceState();
+    if (!ApplyModelSwap(SwapONNXPath))
+    {
+        ensureMsgf(false, TEXT("RDG swap failed during ApplyModelSwap."));
+        ClearPending();
+        return;
+    }
+
+    {
+        FScopeLock Lock(&GModelSwapMutex);
+        LastAcceptedArtifactSignature = SwapSignature;
+    }
+    ClearPending();
+
+    // The new model instance stays active. (The previous version called
+    // ResetInferenceState() here, which destroyed the model just loaded.)
+    LastBatchSize = -1;
+
+    UE_LOG(LogTemp, Log, TEXT("RDG model swap applied: %s"), *SwapONNXPath);
 }
 
 void UAI_RDGCache::FlushInferenceGraph()
@@ -564,55 +804,20 @@ bool UAI_RDGCache::ReinitializeModelFromONNX(const FString& InONNXPath)
     if (InONNXPath.IsEmpty() || !FPaths::FileExists(InONNXPath))
         return false;
 
-    TWeakInterfacePtr<INNERuntimeRDG> Runtime =
-        UE::NNE::GetRuntime<INNERuntimeRDG>(TEXT("NNERuntimeORTDml"));
-    if (!Runtime.IsValid())
-    {
-        ensureMsgf(false, TEXT("RDG Runtime invalid during model reinit"));
-        return false;
-    }
-
-    UNNEModelData* NewModelData =
-        LoadObject<UNNEModelData>(nullptr, *InONNXPath);
+    UNNEModelData* NewModelData = LoadModelDataFromONNX(InONNXPath);
     if (!NewModelData)
-    {
-        ensureMsgf(false,
-            TEXT("Failed to load UNNEModelData from asset path"));
         return false;
-    }
 
-    ModelInstance.Reset();
-    ModelRDG.Reset();
-    LastBatchSize = -1;
-
-    ModelRDG = Runtime->CreateModelRDG(NewModelData);
-    if (!ModelRDG.IsValid())
-    {
-        ensureMsgf(false,
-            TEXT("Failed to create RDG model from new model data"));
-        return false;
-    }
-
-    ModelInstance = ModelRDG->CreateModelInstanceRDG();
-    if (!ModelInstance.IsValid())
-    {
-        ensureMsgf(false,
-            TEXT("Failed to create RDG model instance after swap"));
-        return false;
-    }
-
-    return true;
+    ReleaseCurrentModel();
+    return bUseCPU
+        ? RebuildCPUModelFromData(NewModelData)
+        : RebuildRDGModelFromData(NewModelData);
 }
 
 void UAI_RDGCache::ResetInferenceState()
 {
     LastBatchSize = -1;
-
-    if (ModelInstance.IsValid())
-        ModelInstance.Reset();
-
-    if (ModelRDG.IsValid())
-        ModelRDG.Reset();
+    ReleaseCurrentModel();
 }
 
 UNNEModelData* UAI_RDGCache::LoadModelDataFromONNX(const FString& InONNXPath)
@@ -677,11 +882,6 @@ bool UAI_RDGCache::RebuildRDGModelFromData(UNNEModelData* LoadedModelData)
 
     const FString RuntimeName = TEXT("NNERuntimeORTDml");
 
-    TSharedPtr<UE::NNE::FSharedModelData> SharedModelData =
-        LoadedModelData->GetModelData(RuntimeName);
-    if (!SharedModelData.IsValid())
-        return false;
-
     TWeakInterfacePtr<INNERuntimeRDG> Runtime =
         UE::NNE::GetRuntime<INNERuntimeRDG>(RuntimeName);
     if (!Runtime.IsValid())
@@ -708,9 +908,46 @@ bool UAI_RDGCache::RebuildRDGModelFromData(UNNEModelData* LoadedModelData)
     return true;
 }
 
+bool UAI_RDGCache::RebuildCPUModelFromData(UNNEModelData* LoadedModelData)
+{
+    FScopeLock Lock(&ModelInstanceMutex);
+
+    if (!LoadedModelData)
+        return false;
+
+    TWeakInterfacePtr<INNERuntimeCPU> Runtime =
+        UE::NNE::GetRuntime<INNERuntimeCPU>(TEXT("NNERuntimeORTCpu"));
+    if (!Runtime.IsValid())
+    {
+        UE_LOG(LogTemp, Error, TEXT("NNERuntimeORTCpu runtime not available"));
+        return false;
+    }
+
+    TSharedPtr<UE::NNE::IModelCPU> NewModelCPU = Runtime->CreateModelCPU(LoadedModelData);
+    if (!NewModelCPU.IsValid())
+        return false;
+
+    TSharedPtr<UE::NNE::IModelInstanceCPU> NewInstance = NewModelCPU->CreateModelInstanceCPU();
+    if (!NewInstance.IsValid())
+        return false;
+
+    FScopeLock CPULock(&CPUInferenceMutex);
+    ReleaseCurrentModel();
+    ModelCPU = NewModelCPU;
+    ModelInstanceCPU = NewInstance;
+    CPUShapeBatchSize = -1;
+    LastBatchSize = -1;
+    return true;
+}
+
 void UAI_RDGCache::ReleaseCurrentModel()
 {
     FScopeLock Lock(&ModelInstanceMutex);
     ModelInstance.Reset();
     ModelRDG.Reset();
+
+    FScopeLock CPULock(&CPUInferenceMutex);
+    ModelInstanceCPU.Reset();
+    ModelCPU.Reset();
+    CPUShapeBatchSize = -1;
 }

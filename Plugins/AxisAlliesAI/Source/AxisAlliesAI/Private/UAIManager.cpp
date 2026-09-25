@@ -232,10 +232,14 @@ void UAIManager::BeginMCTS(
     else
         InferenceQueue->Clear();
 
+    // Requests from a previous search were answered or discarded with the
+    // queue; nodes must not stay marked as waiting for an answer.
+    InFlightNodes.Reset();
+
     if (!RDGCache)
     {
         RDGCache = NewObject<UAI_RDGCache>(this);
-        RDGCache->Initialize("NNERuntimeORTDml");
+        RDGCache->Initialize(UAI_RDGCache::InferenceRuntimeName);
     }
 
     const int32 ExistingRoot =
@@ -244,65 +248,6 @@ void UAIManager::BeginMCTS(
             Tree.GetNode(Tree.RootIndex).PlayerId == PlayerId)
         ? Tree.RootIndex
         : INDEX_NONE;
-
-    // A kept tree exists but cannot be reused: log why a new root is built,
-    // and whether the kept root's simulated state matches the real state.
-    if (ExistingRoot == INDEX_NONE && Tree.Nodes.IsValidIndex(Tree.RootIndex))
-    {
-        const FMCTSNode& KeptRoot = Tree.GetNode(Tree.RootIndex);
-
-        // Compare game state (node features + global features).
-        TArray<float> KeptState = KeptRoot.NodeFeatures;
-        KeptState.Append(KeptRoot.GlobalFeatures);
-        int32 StateDiffs = 0;
-        int32 FirstStateDiff = INDEX_NONE;
-        const int32 StateLen = FMath::Max(KeptState.Num(), GameState.Num());
-        for (int32 i = 0; i < StateLen; i++)
-        {
-            const bool bSame = KeptState.IsValidIndex(i) && GameState.IsValidIndex(i) &&
-                FMath::IsNearlyEqual(KeptState[i], GameState[i], 1e-6f);
-            if (!bSame)
-            {
-                StateDiffs++;
-                if (FirstStateDiff == INDEX_NONE) FirstStateDiff = i;
-            }
-        }
-
-        // Compare entity lists (count and every entity's features, in order).
-        int32 TerritoryDiffs = 0;
-        int32 FirstTerritoryDiff = INDEX_NONE;
-        for (int32 t = 0; t < NUM_TERRITORIES; t++)
-        {
-            const int32 KeptNum = KeptRoot.EntityLists.IsValidIndex(t)
-                ? KeptRoot.EntityLists[t].Entities.Num() : 0;
-            const int32 RealNum = InEntityLists.IsValidIndex(t)
-                ? InEntityLists[t].Entities.Num() : 0;
-            bool bSame = (KeptNum == RealNum);
-            for (int32 e = 0; bSame && e < KeptNum; e++)
-            {
-                float KF[UNIT_ENTITY_FEATURE_COUNT] = {};
-                float RF[UNIT_ENTITY_FEATURE_COUNT] = {};
-                KeptRoot.EntityLists[t].Entities[e].ToModelFeatures(KF);
-                InEntityLists[t].Entities[e].ToModelFeatures(RF);
-                bSame = FMemory::Memcmp(KF, RF, sizeof(KF)) == 0;
-            }
-            if (!bSame)
-            {
-                TerritoryDiffs++;
-                if (FirstTerritoryDiff == INDEX_NONE) FirstTerritoryDiff = t;
-            }
-        }
-
-        UE_LOG(LogTemp, Warning,
-            TEXT("NEW ROOT BUILT: requested Phase=%d Player=%d, kept root Phase=%d Player=%d A=%d B=%d C=%d D=%d | StateDiffs=%d FirstStateIndex=%d | TerritoryDiffs=%d FirstTerritory=%d"),
-            PhaseId, PlayerId,
-            KeptRoot.PhaseId, KeptRoot.PlayerId,
-            KeptRoot.PendingActionContext.PendingActionA,
-            KeptRoot.PendingActionContext.PendingActionB,
-            KeptRoot.PendingActionContext.PendingActionC,
-            KeptRoot.PendingActionContext.PendingActionD,
-            StateDiffs, FirstStateDiff, TerritoryDiffs, FirstTerritoryDiff);
-    }
 
     // ----------------------------------------------------------------
     // Per-simulation state for the pending-set batched MCTS
@@ -398,9 +343,30 @@ void UAIManager::BeginMCTS(
                         if (!BN.bPolicyInitialized && !BN.bIsTerminal)
                             continue;
 
-                        // Resume traversal from the now-initialized node
+                        // Leaf has been evaluated: back up its value and
+                        // finish this simulation (do not keep descending).
+                        for (int32 p = 0; p + 1 < S.Path.Num(); p++)
+                        {
+                            if (!Tree.Nodes.IsValidIndex(S.Path[p]))
+                                continue;
+                            FMCTSNode& N = Tree.GetNode(S.Path[p]);
+                            N.VirtualLossCount =
+                                FMath::Max(0, N.VirtualLossCount - 1);
+                            if (Tree.Nodes.IsValidIndex(S.Path[p + 1]))
+                            {
+                                const int32 A =
+                                    Tree.GetNode(S.Path[p + 1]).ActionFromParent;
+                                if (N.VirtualLossEdgeCount.IsValidIndex(A))
+                                    N.VirtualLossEdgeCount[A] =
+                                    FMath::Max(0,
+                                        N.VirtualLossEdgeCount[A] - 1);
+                            }
+                        }
+                        Backpropagate(BlockedNode, PlayerId);
                         S.bPending = false;
-                        S.Current = BlockedNode;
+                        S.bComplete = true;
+                        NumComplete++;
+                        continue;
                     }
 
                     // ---- Traverse down the tree ----
@@ -586,7 +552,10 @@ void UAIManager::BeginMCTS(
                     }
                 }
 
-                if (QueueSize > 0 && (bAllRemainingPending || QueueSize >= 8))
+                // Flush when every remaining simulation is waiting for
+                // inference, or when enough requests have queued up.
+                constexpr int32 InferenceFlushThreshold = 64;
+                if (QueueSize > 0 && (bAllRemainingPending || QueueSize >= InferenceFlushThreshold))
                     FlushInferenceBatch();
 
                 if (!bAnyExpanded && bAllRemainingPending && QueueSize == 0)
@@ -634,29 +603,69 @@ void UAIManager::BeginMCTS(
             }
         };
 
+
+    // ----------------------------------------------------------------
+    // Run simulations in waves. Simulations within a wave run together
+    // (their leaf evaluations are batched); each wave starts from the
+    // tree as updated by the previous waves, so later simulations use
+    // earlier results. Larger waves = bigger inference batches but less
+    // sequential refinement.
+    // ----------------------------------------------------------------
+    // One wave fills one inference batch.
+    constexpr int32 SimulationsPerWave = INFERENCE_BATCH_SIZE;
+    auto RunSimulationWaves = [&](int32 RootIdx, int32 TotalSims)
+        {
+            if (!Tree.Nodes.IsValidIndex(RootIdx))
+                return;
+
+            // ---- Forced move: only one legal action ----
+            // One simulation is enough: it creates the child node, so the
+            // tree (and its pending context) is reused for the next decision.
+            {
+                const FMCTSNode& R = Tree.GetNode(RootIdx);
+                int32 LegalCount = 0;
+                for (bool bLegal : R.LegalActionMask)
+                    if (bLegal) LegalCount++;
+                if (LegalCount <= 1)
+                    TotalSims = FMath::Min(TotalSims, 1);
+            }
+
+            for (int32 Done = 0; Done < TotalSims && !bCancelRequested; )
+            {
+                const int32 WaveSims = FMath::Min(SimulationsPerWave, TotalSims - Done);
+                RunSimulations(RootIdx, WaveSims);
+                Done += WaveSims;
+
+                // ---- Early stop: the result can no longer change ----
+                // If the most-visited root action leads the runner-up by more
+                // than the simulations left, the remaining ones cannot change
+                // which action is best.
+                const int32 Remaining = TotalSims - Done;
+                if (Remaining <= 0 || !Tree.Nodes.IsValidIndex(RootIdx))
+                    continue;
+
+                const FMCTSNode& R = Tree.GetNode(RootIdx);
+                int32 Best = 0;
+                int32 Second = 0;
+                for (int32 a = 0; a < R.EdgeVisitCount.Num(); a++)
+                {
+                    if (!R.LegalActionMask.IsValidIndex(a) || !R.LegalActionMask[a])
+                        continue;
+                    const int32 V = R.EdgeVisitCount[a];
+                    if (V > Best) { Second = Best; Best = V; }
+                    else if (V > Second) { Second = V; }
+                }
+                if (Best - Second > Remaining)
+                    break;
+            }
+        };
+
     // ----------------------------------------------------------------
     // EXISTING ROOT PATH
     // ----------------------------------------------------------------
     if (ExistingRoot != INDEX_NONE && Tree.Nodes.IsValidIndex(ExistingRoot))
     {
         Tree.RootIndex = ExistingRoot;
-
-        // TEST: log every territory where the reused root differs from the real game.
-        {
-            const FMCTSNode& DiagRoot = Tree.GetNode(ExistingRoot);
-            for (int32 t = 0; t < InEntityLists.Num(); t++)
-            {
-                const int32 RootNum = DiagRoot.EntityLists.IsValidIndex(t)
-                    ? DiagRoot.EntityLists[t].Entities.Num() : -1;
-                const int32 RealNum = InEntityLists[t].Entities.Num();
-                if (RootNum != RealNum)
-                {
-                    UE_LOG(LogTemp, Warning,
-                        TEXT("Root %d Phase %d: Territory %d root=%d real=%d"),
-                        ExistingRoot, PhaseId, t, RootNum, RealNum);
-                }
-            }
-        }
 
         if (PendingRootActionContext.bIsValid)
         {
@@ -693,7 +702,7 @@ void UAIManager::BeginMCTS(
         //UE_LOG(LogTemp, Warning,
             //TEXT("BeginMCTS: RunSimulations starting (existing root). TreeNodes=%d NumSims=%d"),
             //Tree.Nodes.Num(), NumSimulations);
-        RunSimulations(RootIndexForBudget, NumSimulations);
+        RunSimulationWaves(RootIndexForBudget, NumSimulations);
         FlushInferenceBatch();
         //UE_LOG(LogTemp, Warning,
             //TEXT("ExistingRoot: bPolicyInitialized=%s LegalMaskNum=%d VisitCount=%d"),
@@ -747,9 +756,10 @@ void UAIManager::BeginMCTS(
     if (IsTrainingMode())
         ApplyRootDirichletNoise(RootNode, 0.25f, 0.3f);
 
-    RunSimulations(RootIndex, NumSimulations);
+    RunSimulationWaves(RootIndex, NumSimulations);
     FlushInferenceBatch();
 }
+
 
 int32 UAIManager::CreateRootNode(
     const TArray<float>& GameState,
@@ -980,6 +990,7 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             );
             Child.LegalActionMask = MaskResult.OutLegalActionMask;
             Child.bIsTerminal = MaskResult.bIsTerminal;
+
         }
     }
     else
@@ -1037,17 +1048,6 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
         Child.ActionFromParent = Action;
         Child.bIsTerminal = Result.bIsTerminal;
         Child.LegalActionMask = Result.OutLegalActionMask;
-
-        if (Parent.PhaseId == static_cast<int32>(EPhaseId::CombatMoveQuantity))
-        {
-            const int32 Territory = EffectivePendingActionA > 0
-                ? (EffectivePendingActionA - 1) / 20 : -1;
-            const int32 EntityCount = Child.EntityLists.IsValidIndex(Territory) ?
-                Child.EntityLists[Territory].Entities.Num() : -1;
-            // TEST: full inputs/outputs of the Phase 19 SimulateTransition call.
-            const int32 ParentSrcCount = Parent.EntityLists.IsValidIndex(Territory)
-                ? Parent.EntityLists[Territory].Entities.Num() : -1;
-        }
 
         if (Child.EntityLists.Num() != NUM_TERRITORIES)
             Child.EntityLists.SetNum(NUM_TERRITORIES);
@@ -1142,6 +1142,21 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             Child.PendingActionContext.PendingActionD = INDEX_NONE;
             Child.PendingActionContext.bIsValid = true;
         }
+        else if (ParentPhase == EPhaseId::PlacementQuantity &&
+            ResultPhase == EPhaseId::AirUnitLandOnCarrierCount)
+        {
+            // PlacementCarrier -> PlacementQuantity -> AirUnitLandOnCarrierCount.
+            // Phase 45 needs A = the PlacementCarrier action (which carrier and
+            // sea zone the plane is assigned to). Carry A forward.
+            Child.PendingActionContext.PendingActionA =
+                Parent.PendingActionContext.bIsValid
+                ? Parent.PendingActionContext.PendingActionA
+                : INDEX_NONE;
+            Child.PendingActionContext.PendingActionB = INDEX_NONE;
+            Child.PendingActionContext.PendingActionC = INDEX_NONE;
+            Child.PendingActionContext.PendingActionD = INDEX_NONE;
+            Child.PendingActionContext.bIsValid = Parent.PendingActionContext.bIsValid;
+        }
         else
         {
             // All other SimulateTransition phases — reset context.
@@ -1160,6 +1175,53 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
     Child.bIsExpanded = false;
     Child.bPolicyInitialized = false;
     Child.MCTSValuePerPlayer.Init(0.0f, NUM_PLAYERS);
+
+    // ----------------------------------------------------------------
+    // PENDING-ACTION FEATURES: GlobalFeatures[147..150] = A, B, C, D
+    // Each value is (action + 1) / action-space size of the phase that
+    // chose it, so 0 means "no pending action". A value carried over
+    // from the parent keeps the parent's feature; a value chosen at the
+    // parent phase is encoded with the parent phase's action-space size.
+    // (Global feature 551 is left to Blueprint.)
+    // ----------------------------------------------------------------
+    {
+        constexpr int32 GLOBAL_PENDING_FIRST = 147;   // A=147, B=148, C=149, D=150
+
+        if (Child.GlobalFeatures.IsValidIndex(GLOBAL_PENDING_FIRST + 3))
+        {
+            const FPendingActionContext& CC = Child.PendingActionContext;
+            const FPendingActionContext& PC = Parent.PendingActionContext;
+
+            const int32 ChildSlots[4] = {
+                CC.PendingActionA, CC.PendingActionB, CC.PendingActionC, CC.PendingActionD };
+            const int32 ParentSlots[4] = {
+                PC.PendingActionA, PC.PendingActionB, PC.PendingActionC, PC.PendingActionD };
+
+            const int32 ParentActionSize = GetPolicySizeForPhase(ParentPhase);
+
+            for (int32 k = 0; k < 4; k++)
+            {
+                const int32 FeatureIndex = GLOBAL_PENDING_FIRST + k;
+                float Value = 0.0f;
+
+                if (CC.bIsValid && ChildSlots[k] >= 0)
+                {
+                    const bool bCarried =
+                        PC.bIsValid &&
+                        ParentSlots[k] == ChildSlots[k] &&
+                        Parent.GlobalFeatures.IsValidIndex(FeatureIndex);
+
+                    if (bCarried)
+                        Value = Parent.GlobalFeatures[FeatureIndex];
+                    else if (ParentActionSize > 0)
+                        Value = FMath::Clamp(
+                            (float)(ChildSlots[k] + 1) / (float)ParentActionSize, 0.0f, 1.0f);
+                }
+
+                Child.GlobalFeatures[FeatureIndex] = Value;
+            }
+        }
+    }
 
     // CRITICAL: re-fetch parent after CreateNode to avoid stale reference
     ChildIndex = Tree.CreateNode(Child);
@@ -1271,19 +1333,61 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
     if (CreatedChild.bIsTerminal)
         return;
 
-    // Assemble entity tensor and enqueue inference request
-    FInferenceRequest Req;
-    Req.NodeFeatures = CreatedChild.NodeFeatures;
-    Req.GlobalFeatures = CreatedChild.GlobalFeatures;
-    AssembleEntityTensor(
-        CreatedChild.EntityLists,
-        Req.EntityTensor,
-        Req.EntityCounts);
-    Req.PhaseId = CreatedChild.PhaseId;
-    Req.PlayerId = CreatedChild.PlayerId;
-    Req.NodeIndex = ChildIndex;
-    Req.ActionSize = GetActionSizeForPhase(CreatedChild.PhaseId);
-    InferenceQueue->Enqueue(Req);
+    // Request network evaluation (uses the inference cache when possible)
+    EvaluateNode(ChildIndex);
+}
+
+
+// ----------------------------------------------------------------
+// Search timing (for benchmarking runtimes and simulation counts).
+// Set bLogSearchTiming to false to silence the per-search summary.
+// Counters are reset at the start of each GetActionFromMCTS search.
+// Place this block and MakeInferenceKey above EvaluateNode,
+// FlushInferenceBatch and GetActionFromMCTS in UAIManager.cpp.
+// ----------------------------------------------------------------
+namespace MCTSTiming
+{
+    static constexpr bool bLogSearchTiming = false;
+    static double InferenceSeconds = 0.0;
+    static int32  InferenceCalls = 0;
+    static int32  InferenceSamples = 0;
+
+    static void Reset()
+    {
+        InferenceSeconds = 0.0;
+        InferenceCalls = 0;
+        InferenceSamples = 0;
+    }
+}
+
+// ----------------------------------------------------------------
+// Inference cache key: hashes exactly what the network sees (node,
+// global and entity inputs) plus the phase/player/action size that
+// select the policy head. Two requests with the same key produce the
+// same network output, so one result can serve both.
+// Place this above EvaluateNode (it is also used by FlushInferenceBatch).
+// ----------------------------------------------------------------
+static FInferenceCacheKey MakeInferenceKey(const FInferenceRequest& Req)
+{
+    uint32 Hash = 0;
+    auto Mix = [&Hash](const TArray<float>& Data)
+        {
+            const uint32 H = Data.Num() > 0
+                ? FCrc::MemCrc32(Data.GetData(), Data.Num() * sizeof(float))
+                : 0u;
+            Hash = HashCombine(Hash, H);
+        };
+    Mix(Req.NodeFeatures);
+    Mix(Req.GlobalFeatures);
+    Mix(Req.EntityTensor);
+    Mix(Req.EntityCounts);
+
+    FInferenceCacheKey Key;
+    Key.StateHash = Hash;
+    Key.PhaseId = Req.PhaseId;
+    Key.PlayerId = Req.PlayerId;
+    Key.ActionSize = Req.ActionSize;
+    return Key;
 }
 
 void UAIManager::EvaluateNode(int32 NodeIndex)
@@ -1325,32 +1429,7 @@ void UAIManager::EvaluateNode(int32 NodeIndex)
         return;
     }
 
-    // Build cache key from combined node+global features
-    TArray<float> CombinedFeatures;
-    CombinedFeatures.Reserve(Node.NodeFeatures.Num() + Node.GlobalFeatures.Num());
-    CombinedFeatures.Append(Node.NodeFeatures);
-    CombinedFeatures.Append(Node.GlobalFeatures);
-
-    FInferenceCacheKey Key = InferenceQueue->BuildKey(
-        CombinedFeatures, Node.PhaseId, Node.PlayerId, ActionSize);
-    Key.ActionSize = ActionSize;
-
-    TPair<TArray<float>, TArray<float>> Cached;
-    if (InferenceQueue->TryGetCache(Key, Cached))
-    {
-        ensureMsgf(
-            Cached.Value.Num() > Node.PlayerId,
-            TEXT("Invalid value vector size for PlayerId %d in NodeIndex %d"),
-            Node.PlayerId, NodeIndex
-        );
-        ApplyInferenceResultToNode(NodeIndex, Cached.Key, Cached.Value);
-        Node.bPolicyInitialized = true;
-        Node.bIsExpanded = true;
-        return;
-    }
-
-    InFlightNodes.Add(NodeIndex);
-
+    // ---- Build the request (the key includes the entity inputs) ----
     FInferenceRequest Req;
     Req.NodeFeatures = Node.NodeFeatures;
     Req.GlobalFeatures = Node.GlobalFeatures;
@@ -1358,7 +1437,19 @@ void UAIManager::EvaluateNode(int32 NodeIndex)
     Req.PhaseId = Node.PhaseId;
     Req.PlayerId = Node.PlayerId;
     Req.NodeIndex = NodeIndex;
-    Req.ActionSize = GetActionSizeForPhase(Node.PhaseId);
+    Req.ActionSize = ActionSize;
+
+    // ---- Cache hit: apply immediately ----
+    const FInferenceCacheKey Key = MakeInferenceKey(Req);
+    TPair<TArray<float>, TArray<float>> Cached;
+    if (InferenceQueue->TryGetCache(Key, Cached))
+    {
+        ApplyInferenceResultToNode(NodeIndex, Cached.Key, Cached.Value);
+        return;
+    }
+
+    // ---- Otherwise queue it; FlushInferenceBatch answers every request ----
+    InFlightNodes.Add(NodeIndex);
     InferenceQueue->Enqueue(Req);
 }
 
@@ -1447,6 +1538,41 @@ void UAIManager::Backpropagate(int32 NodeIndex, int32 RootPlayerId)
     if (!Tree.Nodes.IsValidIndex(NodeIndex))
         return;
 
+    // ----------------------------------------------------------------
+    // LEAF VALUE — one value per player.
+    // The value of the node this simulation reached is propagated up
+    // the whole path. Terminal nodes use the game outcome Blueprint
+    // wrote into GlobalFeatures[GLOBAL_OUTCOME_VALUES + p]; all other
+    // nodes use the network's value estimate.
+    // ----------------------------------------------------------------
+    float LeafValues[NUM_PLAYERS];
+    {
+        const FMCTSNode& Leaf = Tree.GetNode(NodeIndex);
+        for (int32 p = 0; p < NUM_PLAYERS; p++)
+        {
+            float V = 0.0f;
+            if (Leaf.bIsTerminal)
+            {
+                const int32 OutcomeIndex = GLOBAL_OUTCOME_VALUES + p;
+                if (Leaf.GlobalFeatures.IsValidIndex(OutcomeIndex))
+                    V = Leaf.GlobalFeatures[OutcomeIndex];
+            }
+            else if (Leaf.MCTSValuePerPlayer.IsValidIndex(p))
+            {
+                V = Leaf.MCTSValuePerPlayer[p];
+            }
+            LeafValues[p] = FMath::IsFinite(V) ? V : 0.0f;
+        }
+    }
+
+    auto ValueFor = [&LeafValues](int32 PlayerId) -> float
+        {
+            return LeafValues[FMath::Clamp(PlayerId, 0, NUM_PLAYERS - 1)];
+        };
+
+    // RootPlayerId is no longer needed: every edge is scored from the
+    // view of the player who chooses that edge (the parent's player).
+
     int32 CurrentNodeIndex = NodeIndex;
     while (CurrentNodeIndex != INDEX_NONE &&
         Tree.Nodes.IsValidIndex(CurrentNodeIndex))
@@ -1454,39 +1580,10 @@ void UAIManager::Backpropagate(int32 NodeIndex, int32 RootPlayerId)
         FMCTSNode& Node = Tree.GetNode(CurrentNodeIndex);
 
         // ----------------------------------------------------------------
-        // VALUE SELECTION
-        // ----------------------------------------------------------------
-        float NodeValue = 0.0f;
-
-        const int32 SafeRootPlayer = FMath::Clamp(
-            RootPlayerId, 0, NUM_PLAYERS - 1);
-
-        if (Node.bIsTerminal)
-        {
-            const int32 OutcomeIndex =
-                6580 + GLOBAL_OUTCOME_VALUES + SafeRootPlayer;
-            if (Node.GlobalFeatures.IsValidIndex(OutcomeIndex))
-            {
-                const float OutcomeValue =
-                    Node.GlobalFeatures[OutcomeIndex];
-                NodeValue = FMath::IsFinite(OutcomeValue)
-                    ? OutcomeValue : 0.0f;
-            }
-        }
-        else if (Node.MCTSValuePerPlayer.Num() > 0)
-        {
-            const float RawValue =
-                Node.MCTSValuePerPlayer.IsValidIndex(SafeRootPlayer)
-                ? Node.MCTSValuePerPlayer[SafeRootPlayer]
-                : 0.0f;
-            NodeValue = FMath::IsFinite(RawValue) ? RawValue : 0.0f;
-        }
-
-        // ----------------------------------------------------------------
         // NODE STATISTICS UPDATE
         // ----------------------------------------------------------------
         Node.VisitCount += 1;
-        Node.TotalValue += NodeValue;
+        Node.TotalValue += ValueFor(Node.PlayerId);
 
         // Remove virtual loss for this node
         Node.VirtualLossCount = FMath::Max(0, Node.VirtualLossCount - 1);
@@ -1497,6 +1594,9 @@ void UAIManager::Backpropagate(int32 NodeIndex, int32 RootPlayerId)
         {
             FMCTSNode& Parent = Tree.GetNode(ParentIndex);
             const int32 Action = Node.ActionFromParent;
+
+            // Edge value from the view of the player acting at the parent.
+            const float EdgeValue = ValueFor(Parent.PlayerId);
 
             if (Parent.EdgeVisitCount.IsValidIndex(Action))
             {
@@ -1511,13 +1611,13 @@ void UAIManager::Backpropagate(int32 NodeIndex, int32 RootPlayerId)
 
             if (Parent.EdgeValueSum.IsValidIndex(Action))
             {
-                Parent.EdgeValueSum[Action] += NodeValue;
+                Parent.EdgeValueSum[Action] += EdgeValue;
             }
             else if (Action >= 0)
             {
                 Parent.EdgeValueSum.SetNum(
                     FMath::Max(Parent.EdgeValueSum.Num(), Action + 1));
-                Parent.EdgeValueSum[Action] = NodeValue;
+                Parent.EdgeValueSum[Action] = EdgeValue;
             }
 
             // Remove virtual loss edge count on parent
@@ -1649,10 +1749,18 @@ void UAIManager::ApplyInferenceResultToNode(
     InFlightNodes.Remove(NodeIndex);
 }
 
+// FlushInferenceBatch
+// - Requests with identical inputs (same key) are run once and the
+//   result is applied to every node that asked for it.
+// - All phases share one batch: the network computes every head in a
+//   single pass, and each node reads its own phase's head.
+// - Results are stored in the inference cache.
+// ----------------------------------------------------------------
 void UAIManager::FlushInferenceBatch()
 {
     if (!InferenceQueue || !RDGCache)
         return;
+
     TArray<FInferenceRequest> Requests;
     {
         static FCriticalSection FlushMutex;
@@ -1661,180 +1769,161 @@ void UAIManager::FlushInferenceBatch()
     }
     if (Requests.Num() == 0)
         return;
-    Requests.Sort([](const FInferenceRequest& A, const FInferenceRequest& B)
+
+    // ---- Group identical requests ----
+    TArray<FInferenceRequest>   Unique;
+    TArray<FInferenceCacheKey>  UniqueKeys;
+    TArray<TArray<int32>>       NodesPerUnique;
+    TMap<FInferenceCacheKey, int32> KeyToUnique;
+
+    for (FInferenceRequest& Req : Requests)
+    {
+        const FInferenceCacheKey Key = MakeInferenceKey(Req);
+
+        // Already answered (e.g. by an earlier flush in this search)
+        TPair<TArray<float>, TArray<float>> Cached;
+        if (InferenceQueue->TryGetCache(Key, Cached))
         {
-            if (A.PhaseId != B.PhaseId)  return A.PhaseId < B.PhaseId;
-            if (A.PlayerId != B.PlayerId) return A.PlayerId < B.PlayerId;
-            return A.NodeIndex < B.NodeIndex;
-        });
-    TMap<int32, TArray<FInferenceRequest>> PhaseGroups;
-    for (const FInferenceRequest& R : Requests)
-        PhaseGroups.FindOrAdd(R.PhaseId).Add(R);
+            ApplyInferenceResultToNode(Req.NodeIndex, Cached.Key, Cached.Value);
+            continue;
+        }
+
+        if (const int32* Existing = KeyToUnique.Find(Key))
+        {
+            NodesPerUnique[*Existing].Add(Req.NodeIndex);
+            continue;
+        }
+
+        const int32 NewIdx = Unique.Num();
+        KeyToUnique.Add(Key, NewIdx);
+        UniqueKeys.Add(Key);
+        NodesPerUnique.Add({ Req.NodeIndex });
+        Unique.Add(MoveTemp(Req));
+    }
+
+    if (Unique.Num() == 0)
+        return;
+
     static FCriticalSection TreeMutationMutex;
     FScopeLock TreeLock(&TreeMutationMutex);
-    for (auto& It : PhaseGroups)
+
+    // ---- Run in fixed-size batches ----
+    // Every call uses the same batch size, so the runtime never has to
+    // re-prepare the model for a new input shape. Short batches are padded
+    // by repeating their last request; padded results are ignored.
+    // Equal to the batch size the ONNX model was exported with.
+    constexpr int32 FixedBatchSize = INFERENCE_BATCH_SIZE;
+
+    for (int32 Start = 0; Start < Unique.Num(); Start += FixedBatchSize)
     {
-        const TArray<FInferenceRequest>& Group = It.Value;
-        const int32 GroupSize = Group.Num();
-        if (GroupSize <= 0)
-            continue;
-        TArray<FInferenceBatchToken> AllTokens;
-        AllTokens.Reserve(GroupSize);
-        TArray<float> AllH2, AllH3, AllH7, AllH10;
-        TArray<float> AllH13, AllH14, AllH20, AllH49;
-        TArray<float> AllH128, AllH202, AllH330;
-        TArray<float> AllH6581, AllH988;
-        TArray<float> AllValue;
-        AllH2.Reserve(GroupSize * PolicyHeadSize::Head2);
-        AllH3.Reserve(GroupSize * PolicyHeadSize::Head3);
-        AllH7.Reserve(GroupSize * PolicyHeadSize::Head7);
-        AllH10.Reserve(GroupSize * PolicyHeadSize::Head10);
-        AllH13.Reserve(GroupSize * PolicyHeadSize::Head13);
-        AllH14.Reserve(GroupSize * PolicyHeadSize::Head14);
-        AllH20.Reserve(GroupSize * PolicyHeadSize::Head20);
-        AllH49.Reserve(GroupSize * PolicyHeadSize::Head49);
-        AllH128.Reserve(GroupSize * PolicyHeadSize::Head128);
-        AllH202.Reserve(GroupSize * PolicyHeadSize::Head202);
-        AllH330.Reserve(GroupSize * PolicyHeadSize::Head330);
-        AllH6581.Reserve(GroupSize * PolicyHeadSize::Head6581);
-        AllH988.Reserve(GroupSize * PolicyHeadSize::Head988);
-        AllValue.Reserve(GroupSize * NUM_PLAYERS);
-        int32 SubBatchStart = 0;
-        bool  bAnySubBatchFailed = false;
-        while (SubBatchStart < GroupSize)
+        const int32 Count = FMath::Min(FixedBatchSize, Unique.Num() - Start);
+
+        TArray<TArray<float>> NodeFeaturesBatch;
+        TArray<TArray<float>> GlobalFeaturesBatch;
+        TArray<TArray<float>> EntityTensorBatch;
+        TArray<TArray<float>> EntityCountsBatch;
+        TArray<float>         PhaseIds;
+        NodeFeaturesBatch.Reserve(FixedBatchSize);
+        GlobalFeaturesBatch.Reserve(FixedBatchSize);
+        EntityTensorBatch.Reserve(FixedBatchSize);
+        EntityCountsBatch.Reserve(FixedBatchSize);
+        PhaseIds.Reserve(FixedBatchSize);
+
+        for (int32 i = 0; i < FixedBatchSize; i++)
         {
-            const int32 SubBatchSize =
-                FMath::Min(MAX_INFERENCE_BATCH_SIZE, GroupSize - SubBatchStart);
-            TArray<FInferenceBatchToken> SubTokens;
-            SubTokens.SetNumUninitialized(SubBatchSize);
-            TArray<TArray<float>> NodeFeaturesBatch;
-            TArray<TArray<float>> GlobalFeaturesBatch;
-            TArray<TArray<float>> EntityTensorBatch;
-            TArray<TArray<float>> EntityCountsBatch;
-            TArray<float>         PhaseIds;
-            NodeFeaturesBatch.SetNum(SubBatchSize);
-            GlobalFeaturesBatch.SetNum(SubBatchSize);
-            EntityTensorBatch.SetNum(SubBatchSize);
-            EntityCountsBatch.SetNum(SubBatchSize);
-            PhaseIds.SetNumUninitialized(SubBatchSize);
-            for (int32 i = 0; i < SubBatchSize; i++)
-            {
-                const FInferenceRequest& Req = Group[SubBatchStart + i];
-                SubTokens[i].BatchIndex = i;
-                SubTokens[i].NodeIndex = Req.NodeIndex;
-                SubTokens[i].PhaseId = Req.PhaseId;
-                SubTokens[i].PlayerId = Req.PlayerId;
-                NodeFeaturesBatch[i] = Req.NodeFeatures;
-                GlobalFeaturesBatch[i] = Req.GlobalFeatures;
-                EntityTensorBatch[i] = Req.EntityTensor;
-                EntityCountsBatch[i] = Req.EntityCounts;
-                PhaseIds[i] = (float)Req.PhaseId;
-            }
-            TArray<float> SubH2, SubH3, SubH7, SubH10;
-            TArray<float> SubH13, SubH14, SubH20, SubH49;
-            TArray<float> SubH128, SubH202, SubH330;
-            TArray<float> SubH6581, SubH988;
-            TArray<float> SubValue;
-            if (!RDGCache->RunInference(
-                NodeFeaturesBatch,
-                GlobalFeaturesBatch,
-                EntityTensorBatch,
-                EntityCountsBatch,
-                PhaseIds,
-                SubH2, SubH3, SubH7, SubH10,
-                SubH13, SubH14, SubH20, SubH49,
-                SubH128, SubH202, SubH330,
-                SubH6581, SubH988,
-                SubValue))
-            {
-                bAnySubBatchFailed = true;
-                break;
-            }
-            if (!ValidateInferenceOutputsNumerical(
-                SubBatchSize,
-                SubH2, SubH3, SubH7, SubH10,
-                SubH13, SubH14, SubH20, SubH49,
-                SubH128, SubH202, SubH330,
-                SubH6581, SubH988,
-                SubValue))
-            {
-                ensureMsgf(false, TEXT("Invalid NN output values in sub-batch"));
-                bAnySubBatchFailed = true;
-                break;
-            }
-            for (const FInferenceBatchToken& T : SubTokens)
-                AllTokens.Add(T);
-            AllH2.Append(SubH2);       AllH3.Append(SubH3);
-            AllH7.Append(SubH7);
-            AllH10.Append(SubH10);     AllH13.Append(SubH13);
-            AllH14.Append(SubH14);     AllH20.Append(SubH20);
-            AllH49.Append(SubH49);
-            AllH128.Append(SubH128);   AllH202.Append(SubH202);
-            AllH330.Append(SubH330);   AllH6581.Append(SubH6581);
-            AllH988.Append(SubH988);   AllValue.Append(SubValue);
-            SubBatchStart += SubBatchSize;
+            // i >= Count: padding (repeat the last real request)
+            const FInferenceRequest& Req = Unique[Start + FMath::Min(i, Count - 1)];
+            NodeFeaturesBatch.Add(Req.NodeFeatures);
+            GlobalFeaturesBatch.Add(Req.GlobalFeatures);
+            EntityTensorBatch.Add(Req.EntityTensor);
+            EntityCountsBatch.Add(Req.EntityCounts);
+            PhaseIds.Add((float)Req.PhaseId);
         }
-        if (bAnySubBatchFailed)
-            continue;
-        for (int32 i = 0; i < AllTokens.Num(); i++)
+
+        TArray<float> H2, H3, H7, H10, H13, H14, H20, H49;
+        TArray<float> H128, H202, H330, H6581, H988, Value;
+
+        const double InferenceStart = FPlatformTime::Seconds();
+        const bool bRan =
+            RDGCache->RunInference(
+                NodeFeaturesBatch, GlobalFeaturesBatch,
+                EntityTensorBatch, EntityCountsBatch, PhaseIds,
+                H2, H3, H7, H10, H13, H14, H20, H49,
+                H128, H202, H330, H6581, H988, Value);
+        MCTSTiming::InferenceSeconds += FPlatformTime::Seconds() - InferenceStart;
+        MCTSTiming::InferenceCalls++;
+        MCTSTiming::InferenceSamples += Count;
+
+        const bool bOk =
+            bRan &&
+            ValidateInferenceOutputsNumerical(
+                FixedBatchSize,
+                H2, H3, H7, H10, H13, H14, H20, H49,
+                H128, H202, H330, H6581, H988, Value);
+
+        if (!bOk)
         {
-            const FInferenceBatchToken& T = AllTokens[i];
-            if (!Tree.Nodes.IsValidIndex(T.NodeIndex))
-                continue;
-            FMCTSNode& Node = Tree.GetNode(T.NodeIndex);
+            UE_LOG(LogTemp, Error,
+                TEXT("FlushInferenceBatch: inference failed for %d requests"), Count);
+            // Release the nodes so they can be requested again.
+            for (int32 i = 0; i < Count; i++)
+                for (int32 NodeIdx : NodesPerUnique[Start + i])
+                    InFlightNodes.Remove(NodeIdx);
+            continue;
+        }
+
+        for (int32 i = 0; i < Count; i++)
+        {
+            const FInferenceRequest& Req = Unique[Start + i];
             const EPolicyHead Head =
-                GetPolicyHeadForPhase(static_cast<EPhaseId>(Node.PhaseId));
-            const TArray<float>* SourcePolicy = nullptr;
+                GetPolicyHeadForPhase(static_cast<EPhaseId>(Req.PhaseId));
+
+            const TArray<float>* Source = nullptr;
             switch (Head)
             {
-            case EPolicyHead::Head2:    SourcePolicy = &AllH2;    break;
-            case EPolicyHead::Head3:    SourcePolicy = &AllH3;    break;
-            case EPolicyHead::Head7:    SourcePolicy = &AllH7;    break;
-            case EPolicyHead::Head10:   SourcePolicy = &AllH10;   break;
-            case EPolicyHead::Head13:   SourcePolicy = &AllH13;   break;
-            case EPolicyHead::Head14:   SourcePolicy = &AllH14;   break;
-            case EPolicyHead::Head20:   SourcePolicy = &AllH20;   break;
-            case EPolicyHead::Head49:   SourcePolicy = &AllH49;   break;
-            case EPolicyHead::Head128:  SourcePolicy = &AllH128;  break;
-            case EPolicyHead::Head202:  SourcePolicy = &AllH202;  break;
-            case EPolicyHead::Head330:  SourcePolicy = &AllH330;  break;
-            case EPolicyHead::Head6581: SourcePolicy = &AllH6581; break;
-            case EPolicyHead::Head988:  SourcePolicy = &AllH988;  break;
-            default:
-                ensureMsgf(false,
-                    TEXT("Unhandled PolicyHead for node %d"), T.NodeIndex);
-                continue;
+            case EPolicyHead::Head2:    Source = &H2;    break;
+            case EPolicyHead::Head3:    Source = &H3;    break;
+            case EPolicyHead::Head7:    Source = &H7;    break;
+            case EPolicyHead::Head10:   Source = &H10;   break;
+            case EPolicyHead::Head13:   Source = &H13;   break;
+            case EPolicyHead::Head14:   Source = &H14;   break;
+            case EPolicyHead::Head20:   Source = &H20;   break;
+            case EPolicyHead::Head49:   Source = &H49;   break;
+            case EPolicyHead::Head128:  Source = &H128;  break;
+            case EPolicyHead::Head202:  Source = &H202;  break;
+            case EPolicyHead::Head330:  Source = &H330;  break;
+            case EPolicyHead::Head6581: Source = &H6581; break;
+            case EPolicyHead::Head988:  Source = &H988;  break;
+            default: break;
             }
+
             const int32 ActionSize = GetPolicySizeForHead(Head);
-            ensureMsgf(ActionSize > 0,
-                TEXT("Invalid ActionSize for node %d"), T.NodeIndex);
-            if (!SourcePolicy || SourcePolicy->Num() == 0)
+            if (!Source || ActionSize <= 0 ||
+                (i + 1) * ActionSize > Source->Num() ||
+                (i + 1) * NUM_PLAYERS > Value.Num())
             {
                 ensureMsgf(false,
-                    TEXT("Missing policy buffer for node %d"), T.NodeIndex);
+                    TEXT("FlushInferenceBatch: bad policy/value slice for phase %d"),
+                    Req.PhaseId);
+                for (int32 NodeIdx : NodesPerUnique[Start + i])
+                    InFlightNodes.Remove(NodeIdx);
                 continue;
             }
-            const int32 PolicyOffset = i * ActionSize;
-            ensureMsgf(
-                PolicyOffset + ActionSize <= SourcePolicy->Num(),
-                TEXT("Policy slice out-of-bounds for node %d"), T.NodeIndex);
+
             TArray<float> PolicySlice;
             PolicySlice.SetNumUninitialized(ActionSize);
-            FMemory::Memcpy(
-                PolicySlice.GetData(),
-                SourcePolicy->GetData() + PolicyOffset,
-                ActionSize * sizeof(float));
-            const int32 ValueOffset = i * NUM_PLAYERS;
-            ensureMsgf(
-                ValueOffset + NUM_PLAYERS <= AllValue.Num(),
-                TEXT("Value slice out-of-bounds for node %d"), T.NodeIndex);
-            TArray<float> ValuePerPlayer;
-            ValuePerPlayer.SetNumUninitialized(NUM_PLAYERS);
-            FMemory::Memcpy(
-                ValuePerPlayer.GetData(),
-                AllValue.GetData() + ValueOffset,
-                NUM_PLAYERS * sizeof(float));
-            ApplyInferenceResultToNode(T.NodeIndex, PolicySlice, ValuePerPlayer);
+            FMemory::Memcpy(PolicySlice.GetData(),
+                Source->GetData() + i * ActionSize, ActionSize * sizeof(float));
+
+            TArray<float> ValueSlice;
+            ValueSlice.SetNumUninitialized(NUM_PLAYERS);
+            FMemory::Memcpy(ValueSlice.GetData(),
+                Value.GetData() + i * NUM_PLAYERS, NUM_PLAYERS * sizeof(float));
+
+            InferenceQueue->StoreCache(UniqueKeys[Start + i], PolicySlice, ValueSlice);
+
+            for (int32 NodeIdx : NodesPerUnique[Start + i])
+                ApplyInferenceResultToNode(NodeIdx, PolicySlice, ValueSlice);
         }
     }
 }
@@ -1945,13 +2034,34 @@ int32 UAIManager::SelectFinalActionFromVisits(int32 RootIndex, float Temperature
     }
 
     // -----------------------------
+    // TEMPERATURE ~0: PLAY THE MOST-VISITED LEGAL ACTION
+    // -----------------------------
+    if (Temperature <= 1e-6f)
+    {
+        int32 BestAction = -1;
+        float BestVisits = -1.0f;
+        for (int32 Action = 0; Action < ActionSize; Action++)
+        {
+            const bool bLegal =
+                Root.LegalActionMask.IsValidIndex(Action) &&
+                Root.LegalActionMask[Action];
+            if (bLegal && VisitCounts[Action] > BestVisits)
+            {
+                BestVisits = VisitCounts[Action];
+                BestAction = Action;
+            }
+        }
+        return BestAction;
+    }
+
+    // -----------------------------
     // TEMPERATURE-ONLY FINAL POLICY TRANSFORM
     // (NO PUCT OR TREE POLICY IMPACT)
     // -----------------------------
     TArray<float> Prob;
     Prob.Init(0.0f, ActionSize);
 
-    float InvTemp = (Temperature <= 1e-6f) ? 1.0f : (1.0f / Temperature);
+    const float InvTemp = 1.0f / Temperature;
 
     float Norm = 0.0f;
 
@@ -2129,10 +2239,6 @@ void UAIManager::FinalizeMCTS()
 // cleanly, removing virtual losses and backpropagating.
 // ============================================================
 
-#include "Async/Async.h"
-#include "HAL/PlatformProcess.h"
-#include "Misc/Paths.h"
-
 // ------------------------------------------------------------
 // GetActionFromMCTS — async augmentation
 // Existing synchronous body moved into background thread.
@@ -2159,6 +2265,21 @@ int32 UAIManager::GetActionFromMCTS(
             TEXT("GetActionFromMCTS: MCTS already running — ignoring call"));
         return -1;
     }
+
+    // Create UObjects here on the game thread (BeginMCTS runs on the
+    // background thread, where NewObject is not safe).
+    if (!InferenceQueue)
+        InferenceQueue = NewObject<UAI_InferenceQueue>(this);
+    if (!RDGCache && EnsureModelsExist())
+    {
+        RDGCache = NewObject<UAI_RDGCache>(this);
+        RDGCache->Initialize(UAI_RDGCache::InferenceRuntimeName);
+    }
+
+    // Load a newly trained model if one is waiting. Runs here on the game
+    // thread, while no search is running.
+    if (RDGCache)
+        RDGCache->TickModelHotSwap();
 
     bMCTSRunning = true;
     bCancelRequested = false;
@@ -2192,8 +2313,35 @@ int32 UAIManager::GetActionFromMCTS(
             bRootFinalized = false;
             GameStateRef = GameStateRef_.Get();
 
+            MCTSTiming::Reset();
+            UAI_RDGCache::TimingStats = UAI_RDGCache::FInferenceTimingStats();
+            const double SearchStart = FPlatformTime::Seconds();
+
             BeginMCTS(GameStateCopy, PhaseIdCopy, PlayerIdCopy,
                 GameStateRef_.Get(), EntityListsCopy);
+
+            if (MCTSTiming::bLogSearchTiming)
+            {
+                const double SearchMs = (FPlatformTime::Seconds() - SearchStart) * 1000.0;
+                const double InferMs = MCTSTiming::InferenceSeconds * 1000.0;
+                const int32 RootVisits = Tree.Nodes.IsValidIndex(Tree.RootIndex)
+                    ? Tree.GetNode(Tree.RootIndex).VisitCount : 0;
+                UE_LOG(LogTemp, Log,
+                    TEXT("MCTS search: Phase=%d Player=%d Time=%.1fms RootVisits=%d | Inference: %d calls, %d samples, %.1fms (%.1f%% of search), avg batch %.1f"),
+                    PhaseIdCopy, PlayerIdCopy, SearchMs, RootVisits,
+                    MCTSTiming::InferenceCalls, MCTSTiming::InferenceSamples, InferMs,
+                    SearchMs > 0.0 ? 100.0 * InferMs / SearchMs : 0.0,
+                    MCTSTiming::InferenceCalls > 0
+                    ? (double)MCTSTiming::InferenceSamples / MCTSTiming::InferenceCalls : 0.0);
+
+                // GPU stage breakdown (all zero when running on CPU)
+                const UAI_RDGCache::FInferenceTimingStats& T = UAI_RDGCache::TimingStats;
+                UE_LOG(LogTemp, Log,
+                    TEXT("  GPU stages: Prep=%.1fms GameThreadWait=%.1fms Upload=%.1fms Execute=%.1fms Readback=%.1fms"),
+                    T.PrepSeconds * 1000.0, T.GameThreadWaitSeconds * 1000.0,
+                    T.UploadSeconds * 1000.0, T.ExecuteSeconds * 1000.0,
+                    T.ReadbackSeconds * 1000.0);
+            }
 
             if (bCancelRequested)
             {
@@ -2235,6 +2383,17 @@ int32 UAIManager::GetActionFromMCTS(
                     R.bPolicyInitialized, R.LegalActionMask.Num(), LegalCount);
             }
 
+            // Forced move (only one legal action): nothing to learn, so no
+            // training sample is stored for it.
+            bool bForcedMove = false;
+            if (Tree.Nodes.IsValidIndex(RootIndex))
+            {
+                int32 LegalCount = 0;
+                for (bool bLegal : Tree.GetNode(RootIndex).LegalActionMask)
+                    if (bLegal) LegalCount++;
+                bForcedMove = (LegalCount <= 1);
+            }
+
             FinalizeMCTS();
 
             if (Tree.Nodes.IsValidIndex(RootIndex))
@@ -2244,7 +2403,7 @@ int32 UAIManager::GetActionFromMCTS(
             }
 
             const bool bValidAction = (Action >= 0);
-            if (bValidAction)
+            if (bValidAction && !bForcedMove)
             {
                 FString SkipReason;
 
@@ -2337,6 +2496,7 @@ int32 UAIManager::GetActionFromMCTS(
 
     return -1;
 }
+
 
 // ------------------------------------------------------------
 // CancelMCTS — sets cancellation flag
@@ -2565,10 +2725,16 @@ void UAIManager::FinalizeMCTSTrainingPipeline()
 
 float UAIManager::GetMCTSTemperature() const
 {
+    // Number of decisions per game played with exploration (temperature 1.0)
+    // before switching to the most-visited action. Tune to taste.
+    constexpr int32 TRAINING_EXPLORATION_DECISIONS = 200;
+
     if (MCTSContext.Mode == EMCTSMode::Evaluation)
         return 0.0f;
 
-    return 1.0f;
+    // Training: sample in proportion to visits early in each game,
+    // then play the most-visited action.
+    return (CurrentGameSampleCount < TRAINING_EXPLORATION_DECISIONS) ? 1.0f : 0.0f;
 }
 
 bool UAIManager::IsEvaluationMode() const
@@ -3144,10 +3310,13 @@ bool UAIManager::EndAIArenaGame(const TArray<float>& FinalOutcomeValues)
 TArray<float> UAIManager::ExtractNodeFeatures(const TArray<float>& StateBuffer)
 {
     const int32 NodeFeatureSize = NUM_TERRITORIES * NODE_FEATURE_COUNT;
-    ensureMsgf(StateBuffer.Num() >= NodeFeatureSize + GLOBAL_FEATURE_COUNT,
-        TEXT("StateBuffer too small for Graph Transformer input"));
-
     TArray<float> NodeFeatures;
+    if (!ensureMsgf(StateBuffer.Num() >= NodeFeatureSize + GLOBAL_FEATURE_COUNT,
+        TEXT("StateBuffer too small for Graph Transformer input")))
+    {
+        return NodeFeatures;   // empty: the node is rejected before inference
+    }
+
     NodeFeatures.SetNumUninitialized(NodeFeatureSize);
     FMemory::Memcpy(NodeFeatures.GetData(), StateBuffer.GetData(), NodeFeatureSize * sizeof(float));
     return NodeFeatures;
@@ -3156,10 +3325,13 @@ TArray<float> UAIManager::ExtractNodeFeatures(const TArray<float>& StateBuffer)
 TArray<float> UAIManager::ExtractGlobalFeatures(const TArray<float>& StateBuffer)
 {
     const int32 NodeFeatureSize = NUM_TERRITORIES * NODE_FEATURE_COUNT;
-    ensureMsgf(StateBuffer.Num() >= NodeFeatureSize + GLOBAL_FEATURE_COUNT,
-        TEXT("StateBuffer too small for Graph Transformer input"));
-
     TArray<float> GlobalFeatures;
+    if (!ensureMsgf(StateBuffer.Num() >= NodeFeatureSize + GLOBAL_FEATURE_COUNT,
+        TEXT("StateBuffer too small for Graph Transformer input")))
+    {
+        return GlobalFeatures;   // empty: the node is rejected before inference
+    }
+
     GlobalFeatures.SetNumUninitialized(GLOBAL_FEATURE_COUNT);
     FMemory::Memcpy(GlobalFeatures.GetData(),
         StateBuffer.GetData() + NodeFeatureSize,
@@ -3179,7 +3351,7 @@ bool UAIManager::RunEndToEndInferenceSmokeTest()
     if (!RDGCache)
     {
         RDGCache = NewObject<UAI_RDGCache>(this);
-        RDGCache->Initialize(TEXT("NNERuntimeORTDml"));
+        RDGCache->Initialize(UAI_RDGCache::InferenceRuntimeName);
     }
     const bool bCacheValid = RDGCache != nullptr;
     UE_LOG(LogTemp, Warning, TEXT("[1] RDGCache initialized: %s"),
@@ -4034,7 +4206,7 @@ bool UAIManager::RunFullMCTSSystemTest()
     if (!RDGCache)
     {
         RDGCache = NewObject<UAI_RDGCache>(this);
-        RDGCache->Initialize(TEXT("NNERuntimeORTDml"));
+        RDGCache->Initialize(UAI_RDGCache::InferenceRuntimeName);
     }
     UE_LOG(LogTemp, Warning, TEXT("[MCTSTest] [1] Infrastructure: PASS"));
 
@@ -5430,6 +5602,25 @@ int32 UAIManager::GetActionFromAIModel(
         return -1;
     }
 
+    // ---- Model setup on the game thread (UObjects must not be created
+    //      on the background thread) ----
+    if (!RDGCache)
+    {
+        RDGCache = NewObject<UAI_RDGCache>(this);
+        if (!RDGCache->Initialize(UAI_RDGCache::InferenceRuntimeName))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("GetActionFromAIModel: RDGCache failed to initialize"));
+            RDGCache = nullptr;
+            return -1;
+        }
+    }
+    else
+    {
+        // Load a newly trained model if one is waiting
+        RDGCache->TickModelHotSwap();
+    }
+
     // Capture inputs by value for the background thread
     TArray<float>                GameStateCopy = GameState;
     TArray<FTerritoryEntityList> EntityListsCopy = InEntityLists;
@@ -5445,22 +5636,6 @@ int32 UAIManager::GetActionFromAIModel(
         EntityListsCopy,
         PendingACopy, PendingBCopy, PendingCCopy, PendingDCopy]() mutable
         {
-            // ---- Initialize RDGCache if needed ----
-            if (!RDGCache)
-            {
-                RDGCache = NewObject<UAI_RDGCache>(this);
-                if (!RDGCache->Initialize(TEXT("NNERuntimeORTDml")))
-                {
-                    UE_LOG(LogTemp, Error,
-                        TEXT("GetActionFromAIModel: RDGCache failed to initialize"));
-                    AsyncTask(ENamedThreads::GameThread, [this]()
-                        {
-                            OnAIModelActionComplete.Broadcast(-1);
-                        });
-                    return;
-                }
-            }
-
             const bool bHasPendingContext = PendingACopy != INDEX_NONE;
 
             // ----------------------------------------------------------------
@@ -5477,13 +5652,19 @@ int32 UAIManager::GetActionFromAIModel(
             AssembleEntityTensor(EntityListsCopy, EntityTensor, EntityCounts);
 
             // ----------------------------------------------------------------
-            // Build single-item batches
+            // Build the batch: the model has a fixed batch size, so the one
+            // position is repeated to fill it. Only row 0 is used.
             // ----------------------------------------------------------------
-            TArray<TArray<float>> NodeBatch = { NodeFeatures };
-            TArray<TArray<float>> GlobalBatch = { GlobalFeatures };
-            TArray<TArray<float>> EntityBatch = { EntityTensor };
-            TArray<TArray<float>> CountsBatch = { EntityCounts };
-            TArray<float>         PhaseIdsBatch = { (float)PhaseIdCopy };
+            TArray<TArray<float>> NodeBatch;
+            TArray<TArray<float>> GlobalBatch;
+            TArray<TArray<float>> EntityBatch;
+            TArray<TArray<float>> CountsBatch;
+            TArray<float>         PhaseIdsBatch;
+            NodeBatch.Init(NodeFeatures, INFERENCE_BATCH_SIZE);
+            GlobalBatch.Init(GlobalFeatures, INFERENCE_BATCH_SIZE);
+            EntityBatch.Init(EntityTensor, INFERENCE_BATCH_SIZE);
+            CountsBatch.Init(EntityCounts, INFERENCE_BATCH_SIZE);
+            PhaseIdsBatch.Init((float)PhaseIdCopy, INFERENCE_BATCH_SIZE);
 
             // ----------------------------------------------------------------
             // Run inference
@@ -5548,7 +5729,8 @@ int32 UAIManager::GetActionFromAIModel(
                 return;
             }
 
-            if (!PolicyOutput || PolicyOutput->Num() != ActionSize)
+            // Row 0 holds this position's policy.
+            if (!PolicyOutput || PolicyOutput->Num() < ActionSize)
             {
                 UE_LOG(LogTemp, Error,
                     TEXT("GetActionFromAIModel: policy output size mismatch — "

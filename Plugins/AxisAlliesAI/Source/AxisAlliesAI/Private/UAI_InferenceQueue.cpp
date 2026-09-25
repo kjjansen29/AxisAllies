@@ -10,6 +10,10 @@ void UAI_InferenceQueue::DequeueAll(TArray<FInferenceRequest>& OutRequests)
     // Completion is controlled explicitly via MarkCompleted per key.
 }
 
+// UAI_InferenceQueue.cpp
+// Every valid request is queued. Duplicate inputs are merged later by
+// UAIManager::FlushInferenceBatch, which answers all of them, so a
+// request is never silently dropped.
 void UAI_InferenceQueue::Enqueue(const FInferenceRequest& Request)
 {
     // ------------------------------------------------------------
@@ -28,8 +32,7 @@ void UAI_InferenceQueue::Enqueue(const FInferenceRequest& Request)
         return;
 
     // Entity tensor must be exactly NUM_TERRITORIES * MAX_UNIT_ENTITIES_PER_NODE
-    // * UNIT_ENTITY_FEATURE_COUNT floats, or empty (empty is accepted for nodes
-    // where AssembleEntityTensor has not yet been called, e.g. during testing).
+    // * UNIT_ENTITY_FEATURE_COUNT floats, or empty.
     const int32 ExpectedEntityTensorSize =
         NUM_TERRITORIES * MAX_UNIT_ENTITIES_PER_NODE * UNIT_ENTITY_FEATURE_COUNT;
     if (Request.EntityTensor.Num() != 0 &&
@@ -45,34 +48,6 @@ void UAI_InferenceQueue::Enqueue(const FInferenceRequest& Request)
         return;
     }
 
-    // ------------------------------------------------------------
-    // KEY CONSTRUCTION (GRAPH-AWARE ONLY)
-    // Entity tensor is intentionally excluded from the cache key.
-    // The cache key is derived from node and global features only,
-    // matching the assumption that entity state is fully reflected
-    // in the node features for cache-hit purposes. If two requests
-    // share identical node and global features, their entity state
-    // is expected to be identical as well.
-    // ------------------------------------------------------------
-    FInferenceCacheKey Key;
-    Key.StateHash = BuildGraphKey(
-        Request.NodeFeatures,
-        Request.GlobalFeatures,
-        Request.PhaseId,
-        Request.PlayerId,
-        Request.ActionSize
-    ).StateHash;
-    Key.PhaseId = Request.PhaseId;
-    Key.PlayerId = Request.PlayerId;
-    Key.ActionSize = Request.ActionSize;
-
-    // ------------------------------------------------------------
-    // IN-FLIGHT GUARD
-    // ------------------------------------------------------------
-    if (InFlight.Contains(Key))
-        return;
-
-    InFlight.Add(Key);
     Queue.Add(Request);
 }
 

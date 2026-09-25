@@ -62,7 +62,7 @@ struct FMCTSContext
     bool      bRootInitialized = false;
     float     DirichletEpsilon = 0.25f;
     float     DirichletAlpha = 0.3f;
-    int32     SimulationCount = 50;
+    int32     SimulationCount = 400;
 };
 
 struct FInferenceBatchToken

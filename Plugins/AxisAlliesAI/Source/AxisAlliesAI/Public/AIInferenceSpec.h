@@ -21,8 +21,9 @@ FORCEINLINE FString GetTotalReplayBufferExportPath()
 {
     return FPaths::Combine(
         FPaths::ProjectSavedDir(),
-        TEXT("AITraining/TotalReplayBuffer.json"));
+        TEXT("AITraining/Replay/index.json"));
 }
+
 FORCEINLINE FString GetONNXPath()
 {
     return FPaths::Combine(
@@ -144,6 +145,8 @@ static constexpr int32 NUM_UNIT_TYPES = 14;
 static constexpr int32 NUM_TECHNOLOGIES = 12;
 static constexpr int32 NUM_NAT_OBJ = 37;
 static constexpr int32 MAX_INFERENCE_BATCH_SIZE = 512;
+// Fixed batch size of the exported ONNX model. Must match EXPORT_BATCH_SIZE in model.py.
+static constexpr int32 INFERENCE_BATCH_SIZE = 32;
 
 static constexpr int32 GLOBAL_TECH_OFFSET = 39;
 static constexpr int32 TECHS_PER_PLAYER = 12;

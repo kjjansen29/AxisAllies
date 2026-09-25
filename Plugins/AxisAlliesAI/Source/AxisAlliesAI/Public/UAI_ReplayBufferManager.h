@@ -24,7 +24,7 @@ struct FMCTSTrainingSample
     // Unit entity lists: one entry per territory (NUM_TERRITORIES total).
     // Serialized to JSON as "entity_list" in ExportReplayBuffer, matching
     // the format expected by _build_entity_tensors() in model.py:
-    //   [{count: N, entities: [[f0..f16], ...]}, ...]
+    //   [{count: N, entities: [[f0..f24], ...]}, ...]
     TArray<FTerritoryEntityList> EntityLists;
 
     // ------------------------------------------------------------
@@ -33,6 +33,11 @@ struct FMCTSTrainingSample
 
     // Per-policy-head distribution (PhaseId-specific action space)
     TArray<float> PolicyTarget;
+
+    // Legal actions at the root (same length as PolicyTarget).
+    // Serialized as "legal_actions" (list of legal indices); used by
+    // model.py to mask the policy loss.
+    TArray<bool> LegalActionMask;
 
     // Per-player value targets: NUM_PLAYERS floats (ordered as model.py output)
     TArray<float> ValueTarget;
