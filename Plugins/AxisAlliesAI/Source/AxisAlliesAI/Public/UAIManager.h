@@ -159,6 +159,8 @@ public:
         bEpisodeTerminalLocked = false;
         LastSampledActionRootIndex = INDEX_NONE;
         bHasEmittedRootSampleThisStep = false;
+        DiscardedForcedMoveCount = 0;
+        DiscardedRejectedCount = 0;
     }
     // Set pending action context when loading
     UFUNCTION(BlueprintCallable, Category = "AI|MCTS")
@@ -238,6 +240,13 @@ public:
     int32 GetSamplesOnDisk() const
     {
         return UAI_ReplayBufferManager::Get().GetSamplesOnDisk();
+    }
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    int32 GetDiscardedSampleCount(int32& OutForcedMoves, int32& OutRejected) const
+    {
+        OutForcedMoves = DiscardedForcedMoveCount;
+        OutRejected = DiscardedRejectedCount;
+        return OutForcedMoves + OutRejected;
     }
     // Fired on game thread when MCTS completes; Action=-1 if cancelled or failed
     UPROPERTY(BlueprintAssignable, Category = "AI|MCTS")
@@ -557,6 +566,8 @@ private:
     bool SampleSubmarineSurpriseDice(int32 NodeIndex);
 
 private:
+    TAtomic<int32> DiscardedForcedMoveCount{ 0 };
+    TAtomic<int32> DiscardedRejectedCount{ 0 };
 
     TAtomic<bool>   bCancelRequested{ false };
     FThreadSafeBool bMCTSRunning{ false };

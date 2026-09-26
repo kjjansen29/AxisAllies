@@ -2403,6 +2403,10 @@ int32 UAIManager::GetActionFromMCTS(
             }
 
             const bool bValidAction = (Action >= 0);
+            if (bValidAction && bForcedMove)
+            {
+                DiscardedForcedMoveCount++;
+            }
             if (bValidAction && !bForcedMove)
             {
                 FString SkipReason;
@@ -2443,6 +2447,8 @@ int32 UAIManager::GetActionFromMCTS(
 
                 if (!SkipReason.IsEmpty())
                 {
+                    DiscardedRejectedCount++;
+
                     const FString Msg = FString::Printf(
                         TEXT("SAMPLE NOT STORED: Phase=%d Action=%d Reason=%s"),
                         PhaseIdCopy, Action, *SkipReason);
@@ -2564,9 +2570,14 @@ void UAIManager::FinalizeMCTSTrainingPipeline()
             const FString OutDir = FPaths::Combine(
                 GetPythonAIDir());
 
+            // Training batch size: samples per training step. Smaller uses
+            // less GPU memory; keep python.exe's shared GPU memory near 0.
+            constexpr int32 TrainingBatchSize = 32;
+
+            // -u: unbuffered output, so progress lines arrive immediately.
             const FString Params = FString::Printf(
-                TEXT("\"%s\" --dataset \"%s\" --out_dir \"%s\""),
-                *PythonScript, *DatasetPath, *OutDir);
+                TEXT("-u \"%s\" --dataset \"%s\" --out_dir \"%s\" --batch_size %d"),
+                *PythonScript, *DatasetPath, *OutDir, TrainingBatchSize);
 
             void* PipeRead = nullptr;
             void* PipeWrite = nullptr;
@@ -2576,14 +2587,13 @@ void UAIManager::FinalizeMCTSTrainingPipeline()
                 TEXT("python"),
                 *Params,
                 false,  // bLaunchDetached
-                false,  // bLaunchHidden
-                false,  // bLaunchReallyHidden
+                true,   // bLaunchHidden (output goes to the Unreal log)
+                true,   // bLaunchReallyHidden
                 nullptr,
                 0,
                 nullptr,
                 PipeWrite,
-                PipeRead
-            );
+                nullptr);
 
             if (!ProcHandle.IsValid())
             {
@@ -2597,76 +2607,81 @@ void UAIManager::FinalizeMCTSTrainingPipeline()
                 return;
             }
 
-            // ---- Read stdout and parse progress ----
-            // Python prints: [train] step=X/Y ...
-            FString FullOutput;
+            // ---- Handle one complete line of Python output ----
+            // Every line goes to the Unreal log as "[Python] ...".
+            // "[train] step=X/Y ..." lines are broadcast as progress.
+            auto ProcessLine = [this](const FString& Line)
+                {
+                    if (Line.IsEmpty())
+                        return;
+
+                    UE_LOG(LogTemp, Log, TEXT("[Python] %s"), *Line);
+
+                    const int32 StepPos = Line.Find(TEXT("[train] step="));
+                    if (StepPos == INDEX_NONE)
+                        return;
+
+                    const int32 NumStart = StepPos + 13;   // length of "[train] step="
+                    const int32 SlashPos = Line.Find(TEXT("/"), ESearchCase::IgnoreCase,
+                        ESearchDir::FromStart, NumStart);
+                    if (SlashPos == INDEX_NONE)
+                        return;
+                    int32 EndPos = Line.Find(TEXT(" "), ESearchCase::IgnoreCase,
+                        ESearchDir::FromStart, SlashPos);
+                    if (EndPos == INDEX_NONE)
+                        EndPos = Line.Len();
+
+                    const int32 Current = FCString::Atoi(*Line.Mid(NumStart, SlashPos - NumStart));
+                    const int32 Total = FCString::Atoi(*Line.Mid(SlashPos + 1, EndPos - SlashPos - 1));
+                    if (Total <= 0)
+                        return;
+
+                    const float Progress =
+                        FMath::Clamp((float)Current / (float)Total, 0.0f, 1.0f);
+
+                    FTrainingStats Stats;
+                    Stats.SamplesInMemory = UAI_ReplayBufferManager::Get().GetSamplesInMemory();
+                    Stats.SamplesOnDisk = UAI_ReplayBufferManager::Get().GetSamplesOnDisk();
+                    Stats.CurrentEpisodeId = CurrentEpisodeId;
+                    Stats.CurrentGameSampleCount = CurrentGameSampleCount;
+                    Stats.CurrentStep = Current;
+                    Stats.TotalSteps = Total;
+
+                    AsyncTask(ENamedThreads::GameThread, [this, Progress, Stats]()
+                        {
+                            OnTrainingProgress.Broadcast(Progress, Stats);
+                        });
+                };
+
+            // ---- Read output while Python runs; handle complete lines only ----
+            FString Pending;
+            auto ProcessCompleteLines = [&Pending, &ProcessLine]()
+                {
+                    int32 LastNewline = INDEX_NONE;
+                    if (!Pending.FindLastChar(TEXT('\n'), LastNewline))
+                        return;
+                    TArray<FString> Lines;
+                    Pending.Left(LastNewline).ParseIntoArrayLines(Lines);
+                    for (const FString& Line : Lines)
+                        ProcessLine(Line.TrimStartAndEnd());
+                    Pending = Pending.Mid(LastNewline + 1);
+                };
+
             while (FPlatformProcess::IsProcRunning(ProcHandle))
             {
-                FString NewOutput =
-                    FPlatformProcess::ReadPipe(PipeRead);
+                const FString NewOutput = FPlatformProcess::ReadPipe(PipeRead);
                 if (!NewOutput.IsEmpty())
                 {
-                    FullOutput += NewOutput;
-
-                    // Parse progress lines
-                    TArray<FString> Lines;
-                    FullOutput.ParseIntoArrayLines(Lines);
-
-                    for (const FString& Line : Lines)
-                    {
-                        if (!Line.Contains(TEXT("[train] step=")))
-                            continue;
-
-                        // Parse "step=X/Y"
-                        int32 StepStart = Line.Find(TEXT("step=")) + 5;
-                        int32 SlashPos = Line.Find(TEXT("/"), ESearchCase::IgnoreCase,
-                            ESearchDir::FromStart, StepStart);
-                        int32 SpacePos = Line.Find(TEXT(" "), ESearchCase::IgnoreCase,
-                            ESearchDir::FromStart, SlashPos);
-
-                        if (StepStart > 4 && SlashPos > StepStart && SpacePos > SlashPos)
-                        {
-                            const int32 Current = FCString::Atoi(
-                                *Line.Mid(StepStart, SlashPos - StepStart));
-                            const int32 Total = FCString::Atoi(
-                                *Line.Mid(SlashPos + 1, SpacePos - SlashPos - 1));
-
-                            if (Total > 0)
-                            {
-                                const float Progress =
-                                    FMath::Clamp((float)Current / (float)Total,
-                                        0.0f, 1.0f);
-
-                                FTrainingStats Stats;
-                                Stats.SamplesInMemory = UAI_ReplayBufferManager::Get().GetSamplesInMemory();
-                                Stats.SamplesOnDisk = UAI_ReplayBufferManager::Get().GetSamplesOnDisk();
-                                Stats.CurrentEpisodeId = CurrentEpisodeId;
-                                Stats.CurrentGameSampleCount = CurrentGameSampleCount;
-                                Stats.CurrentStep = Current;
-                                Stats.TotalSteps = Total;
-
-                                AsyncTask(ENamedThreads::GameThread,
-                                    [this, Progress, Stats]()
-                                    {
-                                        OnTrainingProgress.Broadcast(Progress, Stats);
-                                    });
-                            }
-                        }
-                    }
-
-                    // Keep only last incomplete line
-                    int32 LastNewline = INDEX_NONE;
-                    FullOutput.FindLastChar('\n', LastNewline);
-                    if (LastNewline != INDEX_NONE)
-                        FullOutput = FullOutput.Mid(LastNewline + 1);
+                    Pending += NewOutput;
+                    ProcessCompleteLines();
                 }
                 FPlatformProcess::Sleep(0.1f);
             }
 
-            // Drain remaining output
-            FString Remaining = FPlatformProcess::ReadPipe(PipeRead);
-            if (!Remaining.IsEmpty())
-                FullOutput += Remaining;
+            // ---- Drain whatever is left after Python exits ----
+            Pending += FPlatformProcess::ReadPipe(PipeRead);
+            ProcessCompleteLines();
+            ProcessLine(Pending.TrimStartAndEnd());
 
             int32 ReturnCode = 0;
             FPlatformProcess::GetProcReturnCode(ProcHandle, &ReturnCode);

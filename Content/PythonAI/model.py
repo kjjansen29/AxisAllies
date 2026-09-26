@@ -144,10 +144,14 @@ class RDGLayerNorm(nn.Module):
         self.bias   = nn.Parameter(torch.zeros(hidden_dim))
 
     def forward(self, x):
+        # Normalization is always computed in float32 for numerical safety
+        # under mixed-precision training (no effect in float32 / ONNX).
+        in_dtype = x.dtype
+        x      = x.float()
         mean   = x.mean(dim=-1, keepdim=True)
         var    = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
         x_norm = (x - mean) / (var + self.eps).sqrt()
-        return self.weight * x_norm + self.bias
+        return (self.weight * x_norm + self.bias).to(in_dtype)
 
 
 class EntitySelfAttention(nn.Module):
@@ -199,7 +203,9 @@ class UnitEntityEncoder(nn.Module):
         x             = self.input_proj(entities.reshape(-1, E, 25))
         counts_flat   = entity_counts.reshape(-1)
         valid         = (counts_flat.reshape(-1, 1) - self.entity_idx).clamp(0.0, 1.0)
-        pad_mask      = (1.0 - valid.reshape(-1, 1, E)) * -1e9
+        # -1e4 (not -1e9) so the mask stays finite in float16; exp(-1e4) is
+        # still exactly 0, so results are unchanged.
+        pad_mask      = (1.0 - valid.reshape(-1, 1, E)) * -1e4
         for layer in self.layers:
             x = layer(x, pad_mask)
         valid_3d  = valid.reshape(-1, E, 1)
@@ -225,7 +231,7 @@ class EdgeAttentionLayer(nn.Module):
         k    = self.k(nodes)
         v    = self.v(nodes)
         attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        mask = (1.0 - adjacency_matrix) * -1e9
+        mask = (1.0 - adjacency_matrix) * -1e4
         attn = F.softmax(attn + mask, dim=-1)
         return torch.matmul(attn, v)
 
@@ -737,13 +743,28 @@ def build_batch(data, idx, device):
     }
 
 
-def train_step(model, batch, optimizer):
+# ----------------------------------------------------------------
+# Mixed precision (CUDA only): bfloat16 when the GPU supports it (no
+# scaling needed), otherwise float16 with a gradient scaler. Losses are
+# always computed in float32.
+# ----------------------------------------------------------------
+def make_amp(device):
+    if device.type != "cuda":
+        return None, None
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16, None
+    return torch.float16, torch.amp.GradScaler("cuda")
+
+
+def train_step(model, batch, optimizer, amp_dtype=None, scaler=None):
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    outputs = model(
-        batch["node_features"], batch["global_features"],
-        batch["unit_entities"], batch["entity_counts"]
-    )
+    with torch.autocast(device_type="cuda", dtype=amp_dtype,
+                        enabled=amp_dtype is not None):
+        outputs = model(
+            batch["node_features"], batch["global_features"],
+            batch["unit_entities"], batch["entity_counts"]
+        )
     total_policy_loss    = 0.0
     per_head_policy_loss = {}
 
@@ -758,7 +779,7 @@ def train_step(model, batch, optimizer):
             mask |= (batch["phase_ids"] == pid)
         if mask.sum() == 0:
             continue
-        preds      = outputs[head_name][mask]
+        preds      = outputs[head_name][mask].float()
         targets    = batch["policy_targets"][head_name]
         legal_mask = batch["policy_masks"][head_name]
         has_target = targets.sum(dim=1) > 0.0
@@ -771,11 +792,28 @@ def train_step(model, batch, optimizer):
         head_loss    = -(norm_targets * logp).sum(dim=1).mean()
         total_policy_loss += head_loss
         per_head_policy_loss[head_name] = head_loss.item()
-    total_value_loss = F.mse_loss(outputs["value"], batch["values"])
+    total_value_loss = F.mse_loss(outputs["value"].float(), batch["values"])
     loss = total_policy_loss + total_value_loss
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-    optimizer.step()
+
+    # Skip a step whose loss is not finite instead of corrupting the weights.
+    if not torch.isfinite(loss):
+        print("[train] non-finite loss: step skipped", flush=True)
+        optimizer.zero_grad(set_to_none=True)
+        return {
+            "loss": float("nan"), "policy_loss": float("nan"),
+            "value_loss": float("nan"), "per_head_policy_loss": {}
+        }
+
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
     return {
         "loss":                 loss.item(),
         "policy_loss":          total_policy_loss.item()
@@ -845,7 +883,7 @@ if __name__ == "__main__":
         pt_path   = os.path.join(out_dir, "axis_allies.pt")
         onnx_path = os.path.join(out_dir, "axis_allies.onnx")
 
-        print(f"[train] Loading dataset: {args.dataset}")
+        print(f"[train] Loading dataset: {args.dataset}", flush=True)
         data          = load_training_dataset(args.dataset)
         total_samples = len(data["phase"])
         print(f"[train] Total samples: {total_samples}")
@@ -861,15 +899,33 @@ if __name__ == "__main__":
 
         model.train()
         optimizer  = torch.optim.Adam(model.parameters(), lr=args.lr)
+        amp_dtype, scaler = make_amp(device)
+        print(f"[train] mixed precision: {amp_dtype if amp_dtype is not None else 'off'}",
+              flush=True)
         batch_size = min(args.batch_size, total_samples)
         steps      = min(
             max(args.steps, (total_samples * 4) // max(batch_size, 1)), 2000)
-        print(f"[train] batch_size={batch_size} steps={steps} device={device}")
+        print(f"[train] batch_size={batch_size} steps={steps} device={device}", flush=True)
 
+        import time
+        train_start = time.time()
         for step in range(steps):
             idx      = select_training_batch(total_samples, batch_size, probs)
             batch    = build_batch(data, idx, device)
-            result   = train_step(model, batch, optimizer)
+            result   = train_step(model, batch, optimizer, amp_dtype, scaler)
+
+            # Progress line for Unreal (OnTrainingProgress) on every step
+            elapsed = time.time() - train_start
+            print(f"[train] step={step+1}/{steps} elapsed={elapsed:.1f}s "
+                  f"per_step={elapsed / (step + 1):.2f}s", flush=True)
+
+            # GPU memory check after the first step
+            if step == 0 and device.type == "cuda":
+                peak_mb  = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+                print(f"[train] GPU memory: peak {peak_mb:.0f} MB of {total_mb:.0f} MB "
+                      f"on {torch.cuda.get_device_name(0)}", flush=True)
+
             if (step + 1) % max(steps // 10, 1) == 0:
                 print(
                     f"[train] step={step+1}/{steps} "
