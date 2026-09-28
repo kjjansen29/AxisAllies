@@ -1077,19 +1077,45 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
         // ----------------------------------------------------------------
         const EPhaseId ResultPhase = static_cast<EPhaseId>(Child.PhaseId);
 
-        if (ParentPhase == EPhaseId::CombatMoveSource ||
-            ParentPhase == EPhaseId::NonCombatSource ||
-            ParentPhase == EPhaseId::StrategicBombingSource ||
-            ParentPhase == EPhaseId::UnitRepair ||
-            ParentPhase == EPhaseId::PurchaseType ||
-            ParentPhase == EPhaseId::KamikazeQuantity ||
-            ParentPhase == EPhaseId::ScrambleSource ||
-            ParentPhase == EPhaseId::BombardSource ||
-            ParentPhase == EPhaseId::SubmarineActionSource ||
-            ParentPhase == EPhaseId::AirUnitLandOnCarrier ||
-            ParentPhase == EPhaseId::PlacementCarrier ||
-            ParentPhase == EPhaseId::SBR_InterceptorCommitment ||
-            ParentPhase == EPhaseId::SBR_EscortCommitment)
+        // A chain only continues when the result is the same player's next
+        // step of a chain (a phase that reads the pending actions). A pass,
+        // or any action after which play moves to another player or to an
+        // unrelated phase, ends the chain: the child gets no pending context.
+        auto IsChainContinuationPhase = [](int32 PhaseId)
+            {
+                switch (PhaseId)
+                {
+                case 3:   // RepairQuantity
+                case 5:   // PurchaseQuantity
+                case 7:   // KamikazeLocation
+                case 10:  // ScrambleUnitDest
+                case 13:  // BombardDest
+                case 17:  // LoadUnitsCombat
+                case 18:  // CombatMoveUnitDest
+                case 21:  // StrategicBombingDecision
+                case 24:  // SubmarineActionType
+                case 30:  // LoadUnitsNonCombat
+                case 31:  // NonCombatUnitDest
+                case 34:  // PlacementQuantity
+                case 36:  // SBR_InterceptorQuantity
+                case 40:  // SBR_EscortQuantity
+                case 43:  // AirUnitLandOnCarrierDest
+                    return true;
+                default:
+                    return false;
+                }
+            };
+        const bool bContinuesChain =
+            Child.PlayerId == ParentPlayerId &&
+            IsChainContinuationPhase(Child.PhaseId);
+
+        if (bIsChainStartPhase && !bContinuesChain)
+        {
+            // Chain-start phase ended without starting a chain (e.g. pass):
+            // no pending context for the next decision.
+            Child.PendingActionContext = FPendingActionContext();
+        }
+        else if (bIsChainStartPhase)
         {
             // SimulateTransition phases that store action in A for chain-final child.
             // CombatMoveSource/NonCombatSource/StrategicBombingSource carry forward
@@ -1245,84 +1271,102 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
     // ----------------------------------------------------------------
     const EPhaseId ChildPhase = static_cast<EPhaseId>(CreatedChild.PhaseId);
 
+    // ----------------------------------------------------------------
+    // Which dice C++ rolls during simulation. Set a flag to false when
+    // Blueprint's SimulateTransition already rolls those dice itself
+    // (otherwise they are rolled twice and can disagree with Blueprint's
+    // phase routing).
+    // ----------------------------------------------------------------
+    constexpr bool bCppRollsCombatDice = false;
+    constexpr bool bCppRollsTechDice = false;
+    constexpr bool bCppRollsKamikazeDice = false;
+    constexpr bool bCppRollsBombardmentDice = false;
+    constexpr bool bCppRollsStrategicBombingDice = false;
+    constexpr bool bCppRollsSubmarineDice = false;
+
     if (ChildPhase == EPhaseId::CombatResolveCasualtyType ||
         ChildPhase == EPhaseId::SBR_AirBattleCasualtyType)
     {
-        // Combat dice or SBR air battle dice.
-        // Check global battle state for pending hits before rolling
-        // to avoid double-rolling when hits were pre-populated by
-        // a prior bombardment, kamikaze, or sub surprise sampling call.
-        const float AtkPending =
-            CreatedChild.GlobalFeatures.IsValidIndex(GLOBAL_BATTLE_ATK_HITS)
-            ? CreatedChild.GlobalFeatures[GLOBAL_BATTLE_ATK_HITS] : 0.0f;
-        const float DefPending =
-            CreatedChild.GlobalFeatures.IsValidIndex(GLOBAL_BATTLE_DEF_HITS)
-            ? CreatedChild.GlobalFeatures[GLOBAL_BATTLE_DEF_HITS] : 0.0f;
-        const bool bHitsAlreadyPending =
-            (AtkPending > 1e-5f) || (DefPending > 1e-5f);
-
-        if (!bHitsAlreadyPending)
+        // Combat is handled here (or by Blueprint); never falls through
+        // to the parent-phase samplers below.
+        if (bCppRollsCombatDice)
         {
-            const bool bDiceRolled = SampleCombatDice(ChildIndex);
-            ensureMsgf(bDiceRolled,
-                TEXT("ExpandNode: SampleCombatDice failed for child %d"),
-                ChildIndex);
+            // Combat dice or SBR air battle dice.
+            // Check global battle state for pending hits before rolling
+            // to avoid double-rolling when hits were pre-populated by
+            // a prior bombardment, kamikaze, or sub surprise sampling call.
+            const float AtkPending =
+                CreatedChild.GlobalFeatures.IsValidIndex(GLOBAL_BATTLE_ATK_HITS)
+                ? CreatedChild.GlobalFeatures[GLOBAL_BATTLE_ATK_HITS] : 0.0f;
+            const float DefPending =
+                CreatedChild.GlobalFeatures.IsValidIndex(GLOBAL_BATTLE_DEF_HITS)
+                ? CreatedChild.GlobalFeatures[GLOBAL_BATTLE_DEF_HITS] : 0.0f;
+            const bool bHitsAlreadyPending =
+                (AtkPending > 1e-5f) || (DefPending > 1e-5f);
 
-            if (bDiceRolled)
+            if (!bHitsAlreadyPending)
             {
-                TArray<float> CasualtyState;
-                CasualtyState.Reserve(
-                    CreatedChild.NodeFeatures.Num() +
-                    CreatedChild.GlobalFeatures.Num());
-                CasualtyState.Append(CreatedChild.NodeFeatures);
-                CasualtyState.Append(CreatedChild.GlobalFeatures);
+                const bool bDiceRolled = SampleCombatDice(ChildIndex);
+                ensureMsgf(bDiceRolled,
+                    TEXT("ExpandNode: SampleCombatDice failed for child %d"),
+                    ChildIndex);
 
-                const FApplyActionResult CasualtyMaskResult =
-                    Internal_GetCasualtyAssignmentMask(
-                        CasualtyState,
-                        CreatedChild.PhaseId,
-                        CreatedChild.PlayerId,
-                        CreatedChild.EntityLists);
-
-                const int32 CreatedChildActionSize =
-                    GetPolicySizeForPhase(
-                        static_cast<EPhaseId>(CreatedChild.PhaseId));
-                if (CasualtyMaskResult.OutLegalActionMask.Num() ==
-                    CreatedChildActionSize)
+                if (bDiceRolled)
                 {
-                    CreatedChild.LegalActionMask =
-                        CasualtyMaskResult.OutLegalActionMask;
+                    TArray<float> CasualtyState;
+                    CasualtyState.Reserve(
+                        CreatedChild.NodeFeatures.Num() +
+                        CreatedChild.GlobalFeatures.Num());
+                    CasualtyState.Append(CreatedChild.NodeFeatures);
+                    CasualtyState.Append(CreatedChild.GlobalFeatures);
+
+                    const FApplyActionResult CasualtyMaskResult =
+                        Internal_GetCasualtyAssignmentMask(
+                            CasualtyState,
+                            CreatedChild.PhaseId,
+                            CreatedChild.PlayerId,
+                            CreatedChild.EntityLists);
+
+                    const int32 CreatedChildActionSize =
+                        GetPolicySizeForPhase(
+                            static_cast<EPhaseId>(CreatedChild.PhaseId));
+                    if (CasualtyMaskResult.OutLegalActionMask.Num() ==
+                        CreatedChildActionSize)
+                    {
+                        CreatedChild.LegalActionMask =
+                            CasualtyMaskResult.OutLegalActionMask;
+                    }
                 }
             }
         }
     }
-    else if (ParentPhase == EPhaseId::Tech)
+    else if (bCppRollsTechDice && ParentPhase == EPhaseId::Tech)
     {
         // Tech dice: Action is number of dice purchased (0-6).
         // Action 0 = skip tech purchase — no dice to roll.
         if (Action > 0)
             SampleTechDice(ChildIndex, Action, ParentPlayerId);
     }
-    else if (ParentPhase == EPhaseId::KamikazeTarget)
+    else if (bCppRollsKamikazeDice && ParentPhase == EPhaseId::KamikazeTarget)
     {
         // Kamikaze strikes: quantity and location in PendingActionContext.
         // Hits written to GlobalFeatures[GLOBAL_BATTLE_DEF_HITS].
         // Also decrements GlobalFeatures[GLOBAL_KAMIKAZE_REMAINING].
         SampleKamikazeDice(ChildIndex);
     }
-    else if (ParentPhase == EPhaseId::BombardQuantity)
+    else if (bCppRollsBombardmentDice && ParentPhase == EPhaseId::BombardQuantity)
     {
         // Offshore bombardment: battleship/cruiser dice after quantity committed.
         // Hits written to GlobalFeatures[GLOBAL_BATTLE_ATK_HITS].
         SampleBombardmentDice(ChildIndex);
     }
-    else if (ParentPhase == EPhaseId::StrategicBombingQuantity)
+    else if (bCppRollsStrategicBombingDice && ParentPhase == EPhaseId::StrategicBombingQuantity)
     {
         // SBR: bomber dice after quantity committed.
         // Facility damage written to NodeFeatures[territory*20+5].
         SampleStrategicBombingDice(ChildIndex);
     }
-    else if (ParentPhase == EPhaseId::SubmarineActionQuantity)
+    else if (bCppRollsSubmarineDice && ParentPhase == EPhaseId::SubmarineActionQuantity)
     {
         // Submarine surprise strike: dice after quantity committed.
         // Hits written to GlobalFeatures[GLOBAL_BATTLE_ATK_HITS/DEF_HITS].
@@ -2574,10 +2618,14 @@ void UAIManager::FinalizeMCTSTrainingPipeline()
             // less GPU memory; keep python.exe's shared GPU memory near 0.
             constexpr int32 TrainingBatchSize = 32;
 
+            // New samples since the last training run: sets the step count.
+            const int32 NewSamples =
+                UAI_ReplayBufferManager::Get().GetNewSamplesSinceLastTraining();
+
             // -u: unbuffered output, so progress lines arrive immediately.
             const FString Params = FString::Printf(
-                TEXT("-u \"%s\" --dataset \"%s\" --out_dir \"%s\" --batch_size %d"),
-                *PythonScript, *DatasetPath, *OutDir, TrainingBatchSize);
+                TEXT("-u \"%s\" --dataset \"%s\" --out_dir \"%s\" --batch_size %d --new_samples %d"),
+                *PythonScript, *DatasetPath, *OutDir, TrainingBatchSize, NewSamples);
 
             void* PipeRead = nullptr;
             void* PipeWrite = nullptr;
@@ -5821,4 +5869,13 @@ TArray<FTerritoryEntityList> UAIManager::DebugSimulateTransition(
 {
     return Internal_SimulateTransition(InState, InPhaseId, InPlayerId, Action, true,
         PendingA, PendingB, PendingC, PendingD, INDEX_NONE, InEntityLists).OutEntityLists;
+}
+
+FApplyActionResult UAIManager::DebugSimulateTransitionFull(
+    const TArray<float>& InState, int32 InPhaseId, int32 InPlayerId, int32 Action,
+    int32 PendingA, int32 PendingB, int32 PendingC, int32 PendingD,
+    const TArray<FTerritoryEntityList>& InEntityLists)
+{
+    return Internal_SimulateTransition(InState, InPhaseId, InPlayerId, Action, true,
+        PendingA, PendingB, PendingC, PendingD, INDEX_NONE, InEntityLists);
 }

@@ -870,6 +870,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int,   default=512)
     parser.add_argument("--steps",      type=int,   default=100)
+    parser.add_argument("--new_samples", type=int,  default=-1,
+                        help="samples added since the last training run; "
+                             "sets the step count when given")
     args = parser.parse_args()
 
     if args.dataset is None:
@@ -903,8 +906,14 @@ if __name__ == "__main__":
         print(f"[train] mixed precision: {amp_dtype if amp_dtype is not None else 'off'}",
               flush=True)
         batch_size = min(args.batch_size, total_samples)
-        steps      = min(
-            max(args.steps, (total_samples * 4) // max(batch_size, 1)), 2000)
+        if args.new_samples > 0:
+            # Train in proportion to NEW data: each new sample is used about
+            # 4 times in this run, whatever the total buffer size.
+            steps = min(max((args.new_samples * 4) // max(batch_size, 1), 50), 1000)
+        else:
+            # Fallback (no new-sample count given): based on total samples.
+            steps = min(
+                max(args.steps, (total_samples * 4) // max(batch_size, 1)), 2000)
         print(f"[train] batch_size={batch_size} steps={steps} device={device}", flush=True)
 
         import time

@@ -148,6 +148,12 @@ public:
         int32 PendingA, int32 PendingB, int32 PendingC, int32 PendingD,
         const TArray<FTerritoryEntityList>& InEntityLists);
 
+    UFUNCTION(BlueprintCallable, Category = "AI|Debug")
+    FApplyActionResult DebugSimulateTransitionFull(
+        const TArray<float>& InState, int32 InPhaseId, int32 InPlayerId, int32 Action,
+        int32 PendingA, int32 PendingB, int32 PendingC, int32 PendingD,
+        const TArray<FTerritoryEntityList>& InEntityLists);
+
     UPROPERTY(BlueprintAssignable, Category = "AI|Training")
     FOnSamplesFlushedDelegate OnSamplesFlushed;
     //
