@@ -35,8 +35,6 @@
 // BATTLE STATE EXCLUSION:
 //   Blueprint excludes units with any commitment or completion flag
 //   when building the battle state unit counts for regular combat.
-//   C++ SampleCombatDice reads unit counts from the battle state block
-//   directly and does not re-filter by entity flags.
 // ============================================================
 USTRUCT(BlueprintType)
 struct FUnitEntity
@@ -125,6 +123,8 @@ struct FTerritoryEntityList
 
 // ============================================================
 // FPendingActionContext
+// Combat/non-combat move chain: A = source, B = first load,
+// C = second load, D = destination. Other chains use A (and B).
 // ============================================================
 USTRUCT()
 struct FPendingActionContext
@@ -132,9 +132,9 @@ struct FPendingActionContext
     GENERATED_BODY()
 
     int32 PendingActionA = INDEX_NONE;
-    int32 PendingActionB = INDEX_NONE;  // LoadUnitsCombat / LoadUnitsNonCombat
-    int32 PendingActionC = INDEX_NONE;  // CombatMoveUnitDest / NonCombatUnitDest
-    int32 PendingActionD = INDEX_NONE;  // Second LoadUnitsCombat / LoadUnitsNonCombat (if transport loads two units)
+    int32 PendingActionB = INDEX_NONE;
+    int32 PendingActionC = INDEX_NONE;
+    int32 PendingActionD = INDEX_NONE;
     bool  bIsValid = false;
 };
 
@@ -147,8 +147,8 @@ struct FMCTSNode
     GENERATED_BODY()
 
     // Graph transformer input state
-    TArray<float> NodeFeatures;    // 329 x 19 = 6,251 floats
-    TArray<float> GlobalFeatures;  // 548 floats
+    TArray<float> NodeFeatures;    // NUM_TERRITORIES x NODE_FEATURE_COUNT = 329 x 20 = 6,580 floats
+    TArray<float> GlobalFeatures;  // GLOBAL_FEATURE_COUNT = 593 floats
 
     UPROPERTY(BlueprintReadWrite)
     TArray<FTerritoryEntityList> EntityLists;
@@ -182,6 +182,10 @@ struct FMCTSNode
     bool bIsExpanded = false;
     bool bPolicyInitialized = false;
     bool bIsTerminal = false;
+
+    // Created by a transition that rolled dice (one sampled outcome of
+    // its action; the search keeps several outcomes per such action).
+    bool bIsChanceOutcome = false;
 
     void InitializeEntityLists()
     {

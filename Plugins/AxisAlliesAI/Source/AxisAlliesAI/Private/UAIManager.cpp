@@ -10,6 +10,12 @@
 #include "Misc/Paths.h"
 #include "HAL/PlatformProcess.h"
 
+#include "Serialization/MemoryWriter.h"
+#include "Serialization/MemoryReader.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Dom/JsonObject.h"
+
 #pragma once
 
 static float GammaSample(FRandomStream& Rng, float Alpha)
@@ -210,6 +216,7 @@ bool UAIManager::EnsureModelsExist()
     return true;
 }
 
+// UAIManager.cpp
 void UAIManager::BeginMCTS(
     const TArray<float>& GameState,
     int32 PhaseId,
@@ -479,13 +486,36 @@ void UAIManager::BeginMCTS(
                         Node.VirtualLossEdgeCount[Action]++;
                         Node.VirtualLossCount++;
 
-                        int32 Next = INDEX_NONE;
+                        // ---- Child for this action ----
+                        // Actions involving dice (children flagged
+                        // bIsChanceOutcome) keep several sampled outcomes:
+                        // each visit rolls a new one until MaxChanceOutcomes
+                        // exist, then picks one of them at random. The
+                        // action's value is the average over its outcomes.
+                        constexpr int32 MaxChanceOutcomes = 6;
+
+                        TArray<int32, TInlineAllocator<MaxChanceOutcomes>> Outcomes;
+                        bool bChanceAction = false;
                         for (int32 ChildIdx : Node.ChildIndices)
                         {
-                            if (Tree.GetNode(ChildIdx).ActionFromParent == Action)
+                            const FMCTSNode& C = Tree.GetNode(ChildIdx);
+                            if (C.ActionFromParent == Action)
                             {
-                                Next = ChildIdx;
-                                break;
+                                Outcomes.Add(ChildIdx);
+                                bChanceAction |= C.bIsChanceOutcome;
+                            }
+                        }
+
+                        int32 Next = INDEX_NONE;
+                        if (Outcomes.Num() > 0)
+                        {
+                            const bool bRollNewOutcome =
+                                bChanceAction && Outcomes.Num() < MaxChanceOutcomes;
+                            if (!bRollNewOutcome)
+                            {
+                                Next = Outcomes.Num() == 1
+                                    ? Outcomes[0]
+                                    : Outcomes[MCTSRandStream.RandRange(0, Outcomes.Num() - 1)];
                             }
                         }
 
@@ -883,6 +913,7 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
             Child.NodeFeatures = ExtractNodeFeatures(StepResult.OutState);
             Child.GlobalFeatures = ExtractGlobalFeatures(StepResult.OutState);
             Child.EntityLists = StepResult.OutEntityLists;
+            Child.bIsChanceOutcome = StepResult.bIsChanceOutcome;
             if (Child.EntityLists.Num() != NUM_TERRITORIES)
                 Child.EntityLists.SetNum(NUM_TERRITORIES);
         }
@@ -1048,6 +1079,10 @@ void UAIManager::ExpandNode(int32 NodeIndex, int32 Action)
         Child.ActionFromParent = Action;
         Child.bIsTerminal = Result.bIsTerminal;
         Child.LegalActionMask = Result.OutLegalActionMask;
+
+        // Blueprint rolled dice for this transition: this child is one
+        // sampled outcome of the action (the search keeps several).
+        Child.bIsChanceOutcome = Result.bIsChanceOutcome;
 
         if (Child.EntityLists.Num() != NUM_TERRITORIES)
             Child.EntityLists.SetNum(NUM_TERRITORIES);
@@ -1802,7 +1837,11 @@ void UAIManager::ApplyInferenceResultToNode(
 // ----------------------------------------------------------------
 void UAIManager::FlushInferenceBatch()
 {
-    if (!InferenceQueue || !RDGCache)
+    // Model for the current search: a past model when the searching player
+    // is an opponent (SetOpponentPlayers), otherwise the current model.
+    UAI_RDGCache* Cache = SearchCache ? SearchCache.Get() : RDGCache;
+
+    if (!InferenceQueue || !Cache)
         return;
 
     TArray<FInferenceRequest> Requests;
@@ -1889,7 +1928,7 @@ void UAIManager::FlushInferenceBatch()
 
         const double InferenceStart = FPlatformTime::Seconds();
         const bool bRan =
-            RDGCache->RunInference(
+            Cache->RunInference(
                 NodeFeaturesBatch, GlobalFeaturesBatch,
                 EntityTensorBatch, EntityCountsBatch, PhaseIds,
                 H2, H3, H7, H10, H13, H14, H20, H49,
@@ -2325,6 +2364,25 @@ int32 UAIManager::GetActionFromMCTS(
     if (RDGCache)
         RDGCache->TickModelHotSwap();
 
+    // ---- Which model searches for this player ----
+    // Opponent players (SetOpponentPlayers) use the loaded past model.
+    const bool bUseOpponent =
+        OpponentCache != nullptr && OpponentPlayerIds.Contains(PlayerId);
+    SearchCache = bUseOpponent ? OpponentCache.Get() : RDGCache;
+
+    // The kept tree's priors and values came from the model of the previous
+    // search; if the model changes, start a fresh tree.
+    if (bUseOpponent != bLastSearchUsedOpponent)
+    {
+        ResetMCTS();
+        Tree = FMCTSTree();
+    }
+    bLastSearchUsedOpponent = bUseOpponent;
+
+    // Samples are stored only in training mode and only for players using
+    // the current model.
+    const bool bStoreSample = IsTrainingMode() && !bUseOpponent;
+
     bMCTSRunning = true;
     bCancelRequested = false;
 
@@ -2337,7 +2395,7 @@ int32 UAIManager::GetActionFromMCTS(
 
     MCTSFuture = Async(EAsyncExecution::Thread, [this,
         GameStateCopy, PhaseIdCopy, PlayerIdCopy,
-        GameStateRef_, EntityListsCopy]() mutable
+        GameStateRef_, EntityListsCopy, bStoreSample, bUseOpponent]() mutable
         {
             // ---- Existing synchronous body (unchanged) ----
             int32 Action = -1;
@@ -2447,11 +2505,16 @@ int32 UAIManager::GetActionFromMCTS(
             }
 
             const bool bValidAction = (Action >= 0);
-            if (bValidAction && bForcedMove)
+            if (bValidAction && bUseOpponent)
+            {
+                // Past-model opponent move: intentionally not stored.
+                OpponentMoveCount++;
+            }
+            else if (bValidAction && bStoreSample && bForcedMove)
             {
                 DiscardedForcedMoveCount++;
             }
-            if (bValidAction && !bForcedMove)
+            if (bValidAction && bStoreSample && !bForcedMove)
             {
                 FString SkipReason;
 
@@ -5693,11 +5756,15 @@ int32 UAIManager::GetActionFromAIModel(
     int32                        PendingBCopy = PendingActionB;
     int32                        PendingCCopy = PendingActionC;
     int32                        PendingDCopy = PendingActionD;
+    const float                  TemperatureCopy = AIModelTemperature;
+    const float                  TopPCopy = AIModelTopP;
+    const int32                  RandomSeed = FMath::Rand();
 
     Async(EAsyncExecution::Thread, [this,
         GameStateCopy, PhaseIdCopy, PlayerIdCopy,
         EntityListsCopy,
-        PendingACopy, PendingBCopy, PendingCCopy, PendingDCopy]() mutable
+        PendingACopy, PendingBCopy, PendingCCopy, PendingDCopy,
+        TemperatureCopy, TopPCopy, RandomSeed]() mutable
         {
             const bool bHasPendingContext = PendingACopy != INDEX_NONE;
 
@@ -5833,22 +5900,73 @@ int32 UAIManager::GetActionFromAIModel(
             }
 
             // ----------------------------------------------------------------
-            // Return argmax of masked policy logits
+            // Choose an action from the model's policy over legal actions.
+            // Temperature 0: always the most likely action.
+            // Temperature > 0: sample from the policy, restricted to the most
+            // likely actions that together make up TopP of the probability,
+            // so unlikely (poor) moves are never picked.
             // ----------------------------------------------------------------
             int32 BestAction = -1;
             float BestLogit = -FLT_MAX;
-            int32 LegalCount = 0;
-
             for (int32 i = 0; i < ActionSize; i++)
             {
                 if (!MaskResult.OutLegalActionMask[i])
                     continue;
-                LegalCount++;
                 const float Logit = (*PolicyOutput)[i];
-                if (Logit > BestLogit)
+                if (FMath::IsFinite(Logit) && Logit > BestLogit)
                 {
                     BestLogit = Logit;
                     BestAction = i;
+                }
+            }
+
+            if (BestAction >= 0 && TemperatureCopy > 1e-3f)
+            {
+                // Softmax over legal actions (with temperature)
+                TArray<TPair<float, int32>> Probs;   // (probability, action)
+                float Sum = 0.0f;
+                for (int32 i = 0; i < ActionSize; i++)
+                {
+                    if (!MaskResult.OutLegalActionMask[i])
+                        continue;
+                    const float Logit = (*PolicyOutput)[i];
+                    if (!FMath::IsFinite(Logit))
+                        continue;
+                    const float P = FMath::Exp((Logit - BestLogit) / TemperatureCopy);
+                    Probs.Add(TPair<float, int32>(P, i));
+                    Sum += P;
+                }
+
+                if (Sum > 0.0f)
+                {
+                    // Keep the most likely actions up to TopP of the total
+                    Probs.Sort([](const TPair<float, int32>& L, const TPair<float, int32>& R)
+                        { return L.Key > R.Key; });
+
+                    const float Cutoff = FMath::Clamp(TopPCopy, 0.0f, 1.0f) * Sum;
+                    float Kept = 0.0f;
+                    int32 NumKept = 0;
+                    for (const TPair<float, int32>& Entry : Probs)
+                    {
+                        Kept += Entry.Key;
+                        NumKept++;
+                        if (Kept >= Cutoff)
+                            break;
+                    }
+
+                    // Sample among the kept actions
+                    FRandomStream Rng(RandomSeed);
+                    float Pick = Rng.FRand() * Kept;
+                    BestAction = Probs[NumKept - 1].Value;
+                    for (int32 k = 0; k < NumKept; k++)
+                    {
+                        Pick -= Probs[k].Key;
+                        if (Pick <= 0.0f)
+                        {
+                            BestAction = Probs[k].Value;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -5878,4 +5996,451 @@ FApplyActionResult UAIManager::DebugSimulateTransitionFull(
 {
     return Internal_SimulateTransition(InState, InPhaseId, InPlayerId, Action, true,
         PendingA, PendingB, PendingC, PendingD, INDEX_NONE, InEntityLists);
+}
+
+TArray<float> UAIManager::GetPositionValue(
+    const TArray<float>& GameState,
+    int32 PhaseId,
+    const TArray<FTerritoryEntityList>& InEntityLists)
+{
+    TArray<float> Values;
+    Values.Init(0.0f, NUM_PLAYERS);
+
+    if (!RDGCache && EnsureModelsExist())
+    {
+        RDGCache = NewObject<UAI_RDGCache>(this);
+        if (!RDGCache->Initialize(UAI_RDGCache::InferenceRuntimeName))
+            RDGCache = nullptr;
+    }
+    if (!RDGCache)
+    {
+        UE_LOG(LogTemp, Error, TEXT("GetPositionValue: model not available"));
+        return Values;
+    }
+
+    const TArray<float> NodeFeatures = ExtractNodeFeatures(GameState);
+    const TArray<float> GlobalFeatures = ExtractGlobalFeatures(GameState);
+    if (NodeFeatures.Num() == 0 || GlobalFeatures.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error, TEXT("GetPositionValue: invalid game state"));
+        return Values;
+    }
+
+    TArray<float> EntityTensor, EntityCounts;
+    AssembleEntityTensor(InEntityLists, EntityTensor, EntityCounts);
+
+    // The model has a fixed batch size: repeat the position, use row 0.
+    TArray<TArray<float>> NodeBatch, GlobalBatch, EntityBatch, CountsBatch;
+    TArray<float> PhaseIds;
+    NodeBatch.Init(NodeFeatures, INFERENCE_BATCH_SIZE);
+    GlobalBatch.Init(GlobalFeatures, INFERENCE_BATCH_SIZE);
+    EntityBatch.Init(EntityTensor, INFERENCE_BATCH_SIZE);
+    CountsBatch.Init(EntityCounts, INFERENCE_BATCH_SIZE);
+    PhaseIds.Init((float)PhaseId, INFERENCE_BATCH_SIZE);
+
+    TArray<float> H2, H3, H7, H10, H13, H14, H20, H49;
+    TArray<float> H128, H202, H330, H6581, H988, ValueOut;
+
+    const bool bOk = RDGCache->RunInference(
+        NodeBatch, GlobalBatch, EntityBatch, CountsBatch, PhaseIds,
+        H2, H3, H7, H10, H13, H14, H20, H49,
+        H128, H202, H330, H6581, H988, ValueOut);
+
+    if (!bOk || ValueOut.Num() < NUM_PLAYERS)
+    {
+        UE_LOG(LogTemp, Error, TEXT("GetPositionValue: inference failed"));
+        return Values;
+    }
+
+    for (int32 p = 0; p < NUM_PLAYERS; p++)
+        Values[p] = FMath::IsFinite(ValueOut[p]) ? FMath::Clamp(ValueOut[p], -1.0f, 1.0f) : 0.0f;
+
+    return Values;
+}
+
+static FString GetPastModelsDir()
+{
+    return FPaths::Combine(FPaths::GetPath(GetONNXPath()), TEXT("PastModels"));
+}
+static FString GetChampionOnnxPath() { return GetPastModelsDir() / TEXT("champion.onnx"); }
+static FString GetChampionPtPath() { return GetPastModelsDir() / TEXT("champion.pt"); }
+static FString GetBenchmarkPath() { return GetPastModelsDir() / TEXT("benchmark.json"); }
+static FString GetWeightPath() { return GetPastModelsDir() / TEXT("position_weight.json"); }
+
+static constexpr float PositionWeightStart = 0.3f;
+static constexpr float PositionWeightStep = 0.025f;
+static constexpr float PositionWeightMax = 0.4f;
+
+static float LoadPositionWeight()
+{
+    FString Text;
+    if (!FFileHelper::LoadFileToString(Text, *GetWeightPath()))
+        return PositionWeightStart;
+
+    TSharedPtr<FJsonObject> Obj;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+    double W = PositionWeightStart;
+    if (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid())
+        Obj->TryGetNumberField(TEXT("w"), W);
+    return FMath::Clamp((float)W, 0.0f, PositionWeightMax);
+}
+
+static void SavePositionWeight(float W)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetNumberField(TEXT("w"), W);
+
+    FString Text;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Text);
+    FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+
+    IFileManager::Get().MakeDirectory(*GetPastModelsDir(), true);
+    FFileHelper::SaveStringToFile(Text, *GetWeightPath());
+}
+
+float UAIManager::GetPositionValueWeight() const
+{
+    return LoadPositionWeight();
+}
+
+static FString GetCurrentModelStamp()
+{
+    const FDateTime Stamp = IFileManager::Get().GetTimeStamp(*GetONNXPath());
+    return FString::Printf(TEXT("%lld_%lld"),
+        Stamp.GetTicks(), IFileManager::Get().FileSize(*GetONNXPath()));
+}
+
+struct FBenchmark
+{
+    FString ModelStamp;
+    int32   Games = 0;
+    int32   Wins = 0;
+    double  CurrentScoreSum = 0.0;
+    double  ChampionScoreSum = 0.0;
+};
+
+static FBenchmark LoadBenchmark()
+{
+    FBenchmark B;
+    B.ModelStamp = GetCurrentModelStamp();
+
+    FString Text;
+    if (!FFileHelper::LoadFileToString(Text, *GetBenchmarkPath()))
+        return B;
+
+    TSharedPtr<FJsonObject> Obj;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+    if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+        return B;
+
+    FString Stamp;
+    if (!Obj->TryGetStringField(TEXT("model_stamp"), Stamp) || Stamp != B.ModelStamp)
+        return B;   // results were for an older model: start fresh
+
+    Obj->TryGetNumberField(TEXT("games"), B.Games);
+    Obj->TryGetNumberField(TEXT("wins"), B.Wins);
+    Obj->TryGetNumberField(TEXT("current_score_sum"), B.CurrentScoreSum);
+    Obj->TryGetNumberField(TEXT("champion_score_sum"), B.ChampionScoreSum);
+    return B;
+}
+
+static bool SaveBenchmark(const FBenchmark& B)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("model_stamp"), B.ModelStamp);
+    Obj->SetNumberField(TEXT("games"), B.Games);
+    Obj->SetNumberField(TEXT("wins"), B.Wins);
+    Obj->SetNumberField(TEXT("current_score_sum"), B.CurrentScoreSum);
+    Obj->SetNumberField(TEXT("champion_score_sum"), B.ChampionScoreSum);
+
+    FString Text;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Text);
+    FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+
+    IFileManager::Get().MakeDirectory(*GetPastModelsDir(), true);
+    return FFileHelper::SaveStringToFile(Text, *GetBenchmarkPath());
+}
+
+bool UAIManager::HasChampionModel() const
+{
+    return FPaths::FileExists(GetChampionOnnxPath()) && FPaths::FileExists(GetChampionPtPath());
+}
+
+void UAIManager::RecordBenchmarkGame(float CurrentTeamScore, float ChampionTeamScore)
+{
+    FBenchmark B = LoadBenchmark();
+    B.Games++;
+    if (CurrentTeamScore > ChampionTeamScore)
+        B.Wins++;
+    B.CurrentScoreSum += CurrentTeamScore;
+    B.ChampionScoreSum += ChampionTeamScore;
+    SaveBenchmark(B);
+}
+
+void UAIManager::GetBenchmarkStatus(int32& OutGames, float& OutWinRate, float& OutAverageMargin) const
+{
+    const FBenchmark B = LoadBenchmark();
+    OutGames = B.Games;
+    OutWinRate = B.Games > 0 ? (float)B.Wins / (float)B.Games : 0.0f;
+    OutAverageMargin = B.Games > 0
+        ? (float)((B.CurrentScoreSum - B.ChampionScoreSum) / B.Games) : 0.0f;
+}
+
+bool UAIManager::TryPromoteChampion(int32 MinGames, float MinWinRate)
+{
+    const bool bHadChampion = HasChampionModel();
+    if (bHadChampion)
+    {
+        int32 Games = 0;
+        float WinRate = 0.0f, Margin = 0.0f;
+        GetBenchmarkStatus(Games, WinRate, Margin);
+        if (Games < MinGames || WinRate < MinWinRate)
+            return false;
+    }
+
+    IFileManager::Get().MakeDirectory(*GetPastModelsDir(), true);
+    const bool bOnnx = IFileManager::Get().Copy(*GetChampionOnnxPath(), *GetONNXPath()) == COPY_OK;
+    const bool bPt = IFileManager::Get().Copy(*GetChampionPtPath(), *GetPTPath()) == COPY_OK;
+    if (!bOnnx || !bPt)
+    {
+        UE_LOG(LogTemp, Error, TEXT("TryPromoteChampion: copy failed"));
+        return false;
+    }
+
+    IFileManager::Get().Delete(*GetBenchmarkPath());
+
+    // A real promotion (beating an existing champion) raises W.
+    if (bHadChampion)
+        SavePositionWeight(FMath::Min(LoadPositionWeight() + PositionWeightStep, PositionWeightMax));
+
+    UE_LOG(LogTemp, Log, TEXT("TryPromoteChampion: current model is the new champion"));
+    return true;
+}
+
+bool UAIManager::LoadChampionAsOpponent()
+{
+    if (bMCTSRunning)
+    {
+        UE_LOG(LogTemp, Error, TEXT("LoadChampionAsOpponent: cannot load while MCTS is running"));
+        return false;
+    }
+    if (!HasChampionModel())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("LoadChampionAsOpponent: no champion model yet"));
+        return false;
+    }
+
+    UAI_RDGCache* NewCache = NewObject<UAI_RDGCache>(this);
+    if (!NewCache->InitializeFromPath(GetChampionOnnxPath(), UAI_RDGCache::InferenceRuntimeName))
+    {
+        UE_LOG(LogTemp, Error, TEXT("LoadChampionAsOpponent: failed to load champion"));
+        return false;
+    }
+
+    OpponentCache = NewCache;
+
+    // Any kept tree may contain values from a different model.
+    ResetMCTS();
+    Tree = FMCTSTree();
+    return true;
+}
+
+void UAIManager::SetOpponentPlayers(const TArray<int32>& PlayerIds)
+{
+    OpponentPlayerIds.Reset();
+    for (int32 Id : PlayerIds)
+        if (Id >= 0 && Id < NUM_PLAYERS)
+            OpponentPlayerIds.Add(Id);
+}
+
+void UAIManager::ClearOpponentPlayers()
+{
+    OpponentPlayerIds.Reset();
+}
+
+void UAIManager::SetEvaluationMode(bool bEvaluation)
+{
+    MCTSContext.Mode = bEvaluation ? EMCTSMode::Evaluation : EMCTSMode::Training;
+}
+
+static constexpr int32 MaxPoolPositions = 200;
+
+static FString GetPositionPoolDir()
+{
+    return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("AITraining/Positions"));
+}
+
+static TArray<FString> GetPositionFiles()
+{
+    TArray<FString> Files;
+    IFileManager::Get().FindFiles(
+        Files, *(GetPositionPoolDir() / TEXT("position_*.bin")), true, false);
+    Files.Sort();   // zero-padded numbers: oldest -> newest
+    return Files;
+}
+
+static void SerializeEntity(FArchive& Ar, FUnitEntity& E)
+{
+    Ar << E.UnitType << E.OwningPlayer << E.Count << E.HitPoints
+        << E.MovementRemaining << E.SlotId;
+    Ar << E.bIsScrambled << E.bHasLoadedThisTurn << E.bHasUnloadedThisTurn
+        << E.bIsSubmerged << E.CombatEngagementState << E.bIsRetreating;
+    Ar << E.CargoUnitTypeA << E.CargoUnitOwnerA << E.CargoUnitTypeB << E.CargoUnitOwnerB;
+    Ar << E.bIsStrategicBombing << E.bIsEscorting << E.bIsIntercepting
+        << E.bIsConductingSurpriseStrike << E.IsBombarding;
+    Ar << E.bHasCompletedSurpriseStrike << E.bHasCompletedBombardment;
+    Ar << E.bIsParatrooper << E.StartOfTurnTerritory;
+}
+
+static bool SerializePosition(
+    FArchive& Ar,
+    TArray<float>& GameState, TArray<FTerritoryEntityList>& EntityLists,
+    int32& PhaseId, int32& PlayerId,
+    int32& PendingA, int32& PendingB, int32& PendingC, int32& PendingD)
+{
+    uint32 Magic = 0x53504141;   // "AAPS"
+    int32  Version = 1;
+    Ar << Magic << Version;
+    if (Ar.IsLoading() && (Magic != 0x53504141 || Version != 1))
+        return false;
+
+    Ar << PhaseId << PlayerId << PendingA << PendingB << PendingC << PendingD;
+    Ar << GameState;
+
+    int32 NumLists = EntityLists.Num();
+    Ar << NumLists;
+    if (Ar.IsLoading())
+    {
+        if (NumLists < 0 || NumLists > 10000)
+            return false;
+        EntityLists.SetNum(NumLists);
+    }
+
+    for (FTerritoryEntityList& List : EntityLists)
+    {
+        int32 NumEntities = List.Entities.Num();
+        Ar << NumEntities;
+        if (Ar.IsLoading())
+        {
+            if (NumEntities < 0 || NumEntities > 10000)
+                return false;
+            List.Entities.SetNum(NumEntities);
+        }
+        for (FUnitEntity& E : List.Entities)
+            SerializeEntity(Ar, E);
+    }
+    return !Ar.IsError();
+}
+
+bool UAIManager::SavePositionToPool(
+    const TArray<float>& GameState,
+    const TArray<FTerritoryEntityList>& EntityLists,
+    int32 PhaseId, int32 PlayerId,
+    int32 PendingA, int32 PendingB, int32 PendingC, int32 PendingD,
+    FString& OutPositionName,
+    TArray<FString>& OutDeletedPositionNames)
+{
+    OutPositionName.Reset();
+    OutDeletedPositionNames.Reset();
+
+    TArray<float> StateCopy = GameState;
+    TArray<FTerritoryEntityList> ListsCopy = EntityLists;
+
+    TArray<uint8> Bytes;
+    FMemoryWriter Writer(Bytes);
+    if (!SerializePosition(Writer, StateCopy, ListsCopy,
+        PhaseId, PlayerId, PendingA, PendingB, PendingC, PendingD))
+        return false;
+
+    const FString Dir = GetPositionPoolDir();
+    IFileManager::Get().MakeDirectory(*Dir, true);
+
+    TArray<FString> Files = GetPositionFiles();
+    int32 NextNumber = 1;
+    for (const FString& File : Files)
+    {
+        const FString Digits = FPaths::GetBaseFilename(File).RightChop(9);   // after "position_"
+        NextNumber = FMath::Max(NextNumber, FCString::Atoi(*Digits) + 1);
+    }
+
+    const FString FileName = FString::Printf(TEXT("position_%06d.bin"), NextNumber);
+    if (!FFileHelper::SaveArrayToFile(Bytes, *(Dir / FileName)))
+    {
+        UE_LOG(LogTemp, Error, TEXT("SavePositionToPool: could not write %s"), *FileName);
+        return false;
+    }
+
+    // Keep only the newest MaxPoolPositions
+    Files.Add(FileName);
+    while (Files.Num() > MaxPoolPositions)
+    {
+        IFileManager::Get().Delete(*(Dir / Files[0]));
+        OutDeletedPositionNames.Add(FPaths::GetBaseFilename(Files[0]));
+        Files.RemoveAt(0);
+    }
+
+    OutPositionName = FPaths::GetBaseFilename(FileName);
+    return true;
+}
+
+bool UAIManager::LoadRandomPositionFromPool(
+    TArray<float>& OutGameState,
+    TArray<FTerritoryEntityList>& OutEntityLists,
+    int32& OutPhaseId, int32& OutPlayerId,
+    int32& OutPendingA, int32& OutPendingB, int32& OutPendingC, int32& OutPendingD,
+    FString& OutPositionName)
+{
+    OutPositionName.Reset();
+
+    const TArray<FString> Files = GetPositionFiles();
+    if (Files.Num() == 0)
+        return false;
+
+    const FString FileName = Files[FMath::RandRange(0, Files.Num() - 1)];
+    const FString Path = GetPositionPoolDir() / FileName;
+
+    TArray<uint8> Bytes;
+    if (!FFileHelper::LoadFileToArray(Bytes, *Path))
+    {
+        UE_LOG(LogTemp, Error, TEXT("LoadRandomPositionFromPool: could not read %s"), *Path);
+        return false;
+    }
+
+    FMemoryReader Reader(Bytes);
+    OutGameState.Reset();
+    OutEntityLists.Reset();
+    if (!SerializePosition(Reader, OutGameState, OutEntityLists,
+        OutPhaseId, OutPlayerId, OutPendingA, OutPendingB, OutPendingC, OutPendingD))
+    {
+        UE_LOG(LogTemp, Error, TEXT("LoadRandomPositionFromPool: invalid file %s"), *Path);
+        return false;
+    }
+
+    OutPositionName = FPaths::GetBaseFilename(FileName);
+    return true;
+}
+
+int32 UAIManager::GetPositionPoolCount() const
+{
+    return GetPositionFiles().Num();
+}
+
+TArray<FString> UAIManager::GetPositionPoolNames() const
+{
+    TArray<FString> Names;
+    for (const FString& File : GetPositionFiles())
+        Names.Add(FPaths::GetBaseFilename(File));
+    return Names;
+}
+
+TArray<FString> UAIManager::ClearPositionPool()
+{
+    TArray<FString> Deleted;
+    const FString Dir = GetPositionPoolDir();
+    for (const FString& File : GetPositionFiles())
+    {
+        IFileManager::Get().Delete(*(Dir / File));
+        Deleted.Add(FPaths::GetBaseFilename(File));
+    }
+    return Deleted;
 }

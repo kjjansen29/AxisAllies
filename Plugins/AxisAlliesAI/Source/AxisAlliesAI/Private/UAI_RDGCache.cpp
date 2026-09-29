@@ -20,8 +20,11 @@ UAI_RDGCache::FInferenceTimingStats UAI_RDGCache::TimingStats;
 
 bool UAI_RDGCache::Initialize(const FString& RuntimeName)
 {
-    const FString ONNXPath = GetONNXPath();
+    return InitializeFromPath(GetONNXPath(), RuntimeName);
+}
 
+bool UAI_RDGCache::InitializeFromPath(const FString& ONNXPath, const FString& RuntimeName)
+{
     if (!FPaths::FileExists(ONNXPath))
     {
         ensureMsgf(false,
@@ -50,7 +53,7 @@ bool UAI_RDGCache::Initialize(const FString& RuntimeName)
     }
 
     bModelInitialized = true;
-    UE_LOG(LogTemp, Log, TEXT("Inference initialized with runtime %s"), *RuntimeName);
+    UE_LOG(LogTemp, Log, TEXT("Inference initialized with runtime %s: %s"), *RuntimeName, *ONNXPath);
     return true;
 }
 

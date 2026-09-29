@@ -40,7 +40,12 @@ public:
     static constexpr const TCHAR* InferenceRuntimeName = TEXT("NNERuntimeORTDml");
 
     // RuntimeName ending in "Cpu" selects the CPU path, otherwise the GPU path.
+    // Initialize loads the current model (GetONNXPath()).
     bool Initialize(const FString& RuntimeName = InferenceRuntimeName);
+
+    // Loads the model at ONNXPath (e.g. a past-model snapshot).
+    bool InitializeFromPath(const FString& ONNXPath,
+        const FString& RuntimeName = InferenceRuntimeName);
     void Reset();
 
     bool IsUsingCPU() const { return bUseCPU; }

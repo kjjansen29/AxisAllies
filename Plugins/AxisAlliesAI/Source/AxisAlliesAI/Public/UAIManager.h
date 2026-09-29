@@ -112,6 +112,9 @@ struct FApplyActionResult
     // Indexed by territory: OutEntityLists[T] = entities at territory T.
     UPROPERTY(BlueprintReadWrite)
     TArray<FTerritoryEntityList> OutEntityLists;
+
+    UPROPERTY(BlueprintReadWrite)
+    bool bIsChanceOutcome = false;
 };
 
 UENUM()
@@ -142,6 +145,75 @@ class AXISALLIESAI_API UAIManager : public UObject
     GENERATED_BODY()
 
 public:
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    float GetPositionValueWeight() const;
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    TArray<float> GetPositionValue(
+        const TArray<float>& GameState,
+        int32 PhaseId,
+        const TArray<FTerritoryEntityList>& InEntityLists);
+    
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    bool HasChampionModel() const;
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    void RecordBenchmarkGame(float CurrentTeamScore, float ChampionTeamScore);
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    void GetBenchmarkStatus(int32& OutGames, float& OutWinRate, float& OutAverageMargin) const;
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    bool TryPromoteChampion(int32 MinGames, float MinWinRate);
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    bool LoadChampionAsOpponent();
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    void SetOpponentPlayers(const TArray<int32>& PlayerIds);
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    void ClearOpponentPlayers();
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    int32 GetOpponentMoveCount() const { return OpponentMoveCount; }
+
+    UFUNCTION(BlueprintCallable, Category = "AI|MCTS")
+    void SetEvaluationMode(bool bEvaluation);
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Models")
+    void SetAIModelSampling(float Temperature, float TopP)
+    {
+        AIModelTemperature = FMath::Max(0.0f, Temperature);
+        AIModelTopP = FMath::Clamp(TopP, 0.01f, 1.0f);
+    }
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    bool SavePositionToPool(
+        const TArray<float>& GameState,
+        const TArray<FTerritoryEntityList>& EntityLists,
+        int32 PhaseId, int32 PlayerId,
+        int32 PendingA, int32 PendingB, int32 PendingC, int32 PendingD,
+        FString& OutPositionName,
+        TArray<FString>& OutDeletedPositionNames);
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    bool LoadRandomPositionFromPool(
+        TArray<float>& OutGameState,
+        TArray<FTerritoryEntityList>& OutEntityLists,
+        int32& OutPhaseId, int32& OutPlayerId,
+        int32& OutPendingA, int32& OutPendingB, int32& OutPendingC, int32& OutPendingD,
+        FString& OutPositionName);
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    int32 GetPositionPoolCount() const;
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    TArray<FString> GetPositionPoolNames() const;
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Training")
+    TArray<FString> ClearPositionPool();
+
     UFUNCTION(BlueprintCallable, Category = "AI|Debug")
     TArray<FTerritoryEntityList> DebugSimulateTransition(
         const TArray<float>& InState, int32 InPhaseId, int32 InPlayerId, int32 Action,
@@ -167,6 +239,7 @@ public:
         bHasEmittedRootSampleThisStep = false;
         DiscardedForcedMoveCount = 0;
         DiscardedRejectedCount = 0;
+        OpponentMoveCount = 0;
     }
     // Set pending action context when loading
     UFUNCTION(BlueprintCallable, Category = "AI|MCTS")
@@ -487,6 +560,19 @@ public:
         int32& OutRound);
 
 private:
+    UPROPERTY()
+    TObjectPtr<UAI_RDGCache> OpponentCache;   // past model for opponent players
+
+    UPROPERTY()
+    TObjectPtr<UAI_RDGCache> SearchCache;     // model used by the current search
+
+    TSet<int32>    OpponentPlayerIds;
+    bool           bLastSearchUsedOpponent = false;
+    TAtomic<int32> OpponentMoveCount{ 0 };
+
+    float          AIModelTemperature = 0.0f;   // 0 = best action (previous behavior)
+    float          AIModelTopP = 0.9f;
+
     FPendingActionContext PendingRootActionContext;
 
     bool SampleCombatDice(int32 NodeIndex);
