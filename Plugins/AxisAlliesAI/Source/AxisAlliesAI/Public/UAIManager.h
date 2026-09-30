@@ -145,6 +145,10 @@ class AXISALLIESAI_API UAIManager : public UObject
     GENERATED_BODY()
 
 public:
+
+    UFUNCTION(BlueprintCallable, Category = "AI|Opponents")
+    int32 GetChampionGeneration() const;
+
     UFUNCTION(BlueprintCallable, Category = "AI|Training")
     float GetPositionValueWeight() const;
 

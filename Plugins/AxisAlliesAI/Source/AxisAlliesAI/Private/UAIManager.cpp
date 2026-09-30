@@ -6066,6 +6066,7 @@ static FString GetChampionOnnxPath() { return GetPastModelsDir() / TEXT("champio
 static FString GetChampionPtPath() { return GetPastModelsDir() / TEXT("champion.pt"); }
 static FString GetBenchmarkPath() { return GetPastModelsDir() / TEXT("benchmark.json"); }
 static FString GetWeightPath() { return GetPastModelsDir() / TEXT("position_weight.json"); }
+static FString GetChampionInfoPath() { return GetPastModelsDir() / TEXT("champion_info.json"); }
 
 static constexpr float PositionWeightStart = 0.3f;
 static constexpr float PositionWeightStep = 0.025f;
@@ -6103,26 +6104,24 @@ float UAIManager::GetPositionValueWeight() const
     return LoadPositionWeight();
 }
 
-static FString GetCurrentModelStamp()
+static constexpr int32 MaxStoredBenchmarkGames = 50;   // games kept on disk
+static constexpr int32 BenchmarkStatusWindow = 10;     // games GetBenchmarkStatus reports on
+
+struct FBenchmarkGame
 {
-    const FDateTime Stamp = IFileManager::Get().GetTimeStamp(*GetONNXPath());
-    return FString::Printf(TEXT("%lld_%lld"),
-        Stamp.GetTicks(), IFileManager::Get().FileSize(*GetONNXPath()));
-}
+    float CurrentScore = 0.0f;
+    float ChampionScore = 0.0f;
+};
 
 struct FBenchmark
 {
-    FString ModelStamp;
-    int32   Games = 0;
-    int32   Wins = 0;
-    double  CurrentScoreSum = 0.0;
-    double  ChampionScoreSum = 0.0;
+    int32 TotalGames = 0;                 // all games since this champion
+    TArray<FBenchmarkGame> RecentGames;   // oldest first, up to MaxStoredBenchmarkGames
 };
 
 static FBenchmark LoadBenchmark()
 {
     FBenchmark B;
-    B.ModelStamp = GetCurrentModelStamp();
 
     FString Text;
     if (!FFileHelper::LoadFileToString(Text, *GetBenchmarkPath()))
@@ -6133,25 +6132,39 @@ static FBenchmark LoadBenchmark()
     if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
         return B;
 
-    FString Stamp;
-    if (!Obj->TryGetStringField(TEXT("model_stamp"), Stamp) || Stamp != B.ModelStamp)
-        return B;   // results were for an older model: start fresh
+    Obj->TryGetNumberField(TEXT("total_games"), B.TotalGames);
 
-    Obj->TryGetNumberField(TEXT("games"), B.Games);
-    Obj->TryGetNumberField(TEXT("wins"), B.Wins);
-    Obj->TryGetNumberField(TEXT("current_score_sum"), B.CurrentScoreSum);
-    Obj->TryGetNumberField(TEXT("champion_score_sum"), B.ChampionScoreSum);
+    const TArray<TSharedPtr<FJsonValue>>* Games = nullptr;
+    if (Obj->TryGetArrayField(TEXT("recent_games"), Games))
+    {
+        for (const TSharedPtr<FJsonValue>& V : *Games)
+        {
+            const TSharedPtr<FJsonObject>* G = nullptr;
+            if (!V.IsValid() || !V->TryGetObject(G))
+                continue;
+            double Current = 0.0, Champion = 0.0;
+            (*G)->TryGetNumberField(TEXT("current"), Current);
+            (*G)->TryGetNumberField(TEXT("champion"), Champion);
+            B.RecentGames.Add({ (float)Current, (float)Champion });
+        }
+    }
     return B;
 }
 
 static bool SaveBenchmark(const FBenchmark& B)
 {
     TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetStringField(TEXT("model_stamp"), B.ModelStamp);
-    Obj->SetNumberField(TEXT("games"), B.Games);
-    Obj->SetNumberField(TEXT("wins"), B.Wins);
-    Obj->SetNumberField(TEXT("current_score_sum"), B.CurrentScoreSum);
-    Obj->SetNumberField(TEXT("champion_score_sum"), B.ChampionScoreSum);
+    Obj->SetNumberField(TEXT("total_games"), B.TotalGames);
+
+    TArray<TSharedPtr<FJsonValue>> Games;
+    for (const FBenchmarkGame& G : B.RecentGames)
+    {
+        TSharedPtr<FJsonObject> GObj = MakeShared<FJsonObject>();
+        GObj->SetNumberField(TEXT("current"), G.CurrentScore);
+        GObj->SetNumberField(TEXT("champion"), G.ChampionScore);
+        Games.Add(MakeShared<FJsonValueObject>(GObj));
+    }
+    Obj->SetArrayField(TEXT("recent_games"), Games);
 
     FString Text;
     TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Text);
@@ -6159,6 +6172,29 @@ static bool SaveBenchmark(const FBenchmark& B)
 
     IFileManager::Get().MakeDirectory(*GetPastModelsDir(), true);
     return FFileHelper::SaveStringToFile(Text, *GetBenchmarkPath());
+}
+
+// Win rate and average margin over the most recent Count games.
+static void SummarizeRecent(const FBenchmark& B, int32 Count,
+    int32& OutGames, float& OutWinRate, float& OutAverageMargin)
+{
+    OutGames = FMath::Min(Count, B.RecentGames.Num());
+    OutWinRate = 0.0f;
+    OutAverageMargin = 0.0f;
+    if (OutGames <= 0)
+        return;
+
+    int32 Wins = 0;
+    double MarginSum = 0.0;
+    for (int32 i = B.RecentGames.Num() - OutGames; i < B.RecentGames.Num(); i++)
+    {
+        const FBenchmarkGame& G = B.RecentGames[i];
+        if (G.CurrentScore > G.ChampionScore)
+            Wins++;
+        MarginSum += G.CurrentScore - G.ChampionScore;
+    }
+    OutWinRate = (float)Wins / (float)OutGames;
+    OutAverageMargin = (float)(MarginSum / OutGames);
 }
 
 bool UAIManager::HasChampionModel() const
@@ -6169,21 +6205,46 @@ bool UAIManager::HasChampionModel() const
 void UAIManager::RecordBenchmarkGame(float CurrentTeamScore, float ChampionTeamScore)
 {
     FBenchmark B = LoadBenchmark();
-    B.Games++;
-    if (CurrentTeamScore > ChampionTeamScore)
-        B.Wins++;
-    B.CurrentScoreSum += CurrentTeamScore;
-    B.ChampionScoreSum += ChampionTeamScore;
+    B.TotalGames++;
+    B.RecentGames.Add({ CurrentTeamScore, ChampionTeamScore });
+    while (B.RecentGames.Num() > MaxStoredBenchmarkGames)
+        B.RecentGames.RemoveAt(0);
     SaveBenchmark(B);
 }
 
 void UAIManager::GetBenchmarkStatus(int32& OutGames, float& OutWinRate, float& OutAverageMargin) const
 {
     const FBenchmark B = LoadBenchmark();
-    OutGames = B.Games;
-    OutWinRate = B.Games > 0 ? (float)B.Wins / (float)B.Games : 0.0f;
-    OutAverageMargin = B.Games > 0
-        ? (float)((B.CurrentScoreSum - B.ChampionScoreSum) / B.Games) : 0.0f;
+    int32 WindowGames = 0;
+    SummarizeRecent(B, BenchmarkStatusWindow, WindowGames, OutWinRate, OutAverageMargin);
+    OutGames = B.TotalGames;
+}
+
+static int32 LoadChampionGeneration()
+{
+    FString Text;
+    if (!FFileHelper::LoadFileToString(Text, *GetChampionInfoPath()))
+        return 0;
+
+    TSharedPtr<FJsonObject> Obj;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+    int32 Generation = 0;
+    if (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid())
+        Obj->TryGetNumberField(TEXT("generation"), Generation);
+    return FMath::Max(0, Generation);
+}
+
+static void SaveChampionGeneration(int32 Generation)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetNumberField(TEXT("generation"), Generation);
+
+    FString Text;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Text);
+    FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+
+    IFileManager::Get().MakeDirectory(*GetPastModelsDir(), true);
+    FFileHelper::SaveStringToFile(Text, *GetChampionInfoPath());
 }
 
 bool UAIManager::TryPromoteChampion(int32 MinGames, float MinWinRate)
@@ -6191,9 +6252,10 @@ bool UAIManager::TryPromoteChampion(int32 MinGames, float MinWinRate)
     const bool bHadChampion = HasChampionModel();
     if (bHadChampion)
     {
+        const FBenchmark B = LoadBenchmark();
         int32 Games = 0;
         float WinRate = 0.0f, Margin = 0.0f;
-        GetBenchmarkStatus(Games, WinRate, Margin);
+        SummarizeRecent(B, FMath::Max(1, MinGames), Games, WinRate, Margin);
         if (Games < MinGames || WinRate < MinWinRate)
             return false;
     }
@@ -6208,6 +6270,9 @@ bool UAIManager::TryPromoteChampion(int32 MinGames, float MinWinRate)
     }
 
     IFileManager::Get().Delete(*GetBenchmarkPath());
+
+    // First champion = generation 1; each replacement adds 1.
+    SaveChampionGeneration(bHadChampion ? FMath::Max(1, LoadChampionGeneration()) + 1 : 1);
 
     // A real promotion (beating an existing champion) raises W.
     if (bHadChampion)
@@ -6443,4 +6508,10 @@ TArray<FString> UAIManager::ClearPositionPool()
         Deleted.Add(FPaths::GetBaseFilename(File));
     }
     return Deleted;
+}
+
+// Champion generation (1 = first champion); 0 if there is no champion.
+int32 UAIManager::GetChampionGeneration() const
+{
+    return HasChampionModel() ? FMath::Max(1, LoadChampionGeneration()) : 0;
 }
