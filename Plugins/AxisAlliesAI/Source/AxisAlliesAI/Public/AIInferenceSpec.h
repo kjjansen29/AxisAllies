@@ -30,6 +30,12 @@ FORCEINLINE FString GetONNXPath()
         GetPythonAIDir(),
         TEXT("axis_allies.onnx"));
 }
+
+FORCEINLINE FString GetPythonExePath()
+{
+    return TEXT("C:/Users/Kevin/AppData/Local/Programs/Python/Python311/python.exe");
+}
+
 FORCEINLINE FString GetPTPath()
 {
     return FPaths::Combine(

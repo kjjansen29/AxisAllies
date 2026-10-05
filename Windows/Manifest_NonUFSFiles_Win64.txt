@@ -1,4 +1,4 @@
-AxisAllies/Binaries/Win64/AxisAllies.exe	2026-09-30T09:44:12.120Z
+AxisAllies/Binaries/Win64/AxisAllies.exe	2026-10-05T07:51:17.214Z
 AxisAllies/Binaries/Win64/D3D12/x64/D3D12Core.dll	2026-04-23T07:42:31.512Z
 AxisAllies/Binaries/Win64/D3D12/x64/d3d12SDKLayers.dll	2026-04-23T07:42:31.626Z
 AxisAllies/Binaries/Win64/DML/x64/DirectML.dll	2026-04-23T07:42:07.419Z
@@ -17,13 +17,13 @@ Engine/Binaries/ThirdParty/Windows/XAudio2_9/x64/xaudio2_9redist.dll	2026-04-23T
 Engine/Content/Renderer/TessellationTable.bin	2026-04-23T07:31:28.539Z
 Engine/Content/Slate/Cursor/invisible.cur	2026-04-23T07:31:28.574Z
 Engine/Plugins/NNE/NNERuntimeORT/Binaries/ThirdParty/Onnxruntime/Win64/onnxruntime.dll	2026-04-23T07:39:40.490Z
-Engine/Config/StagedBuild_AxisAllies.ini	2026-09-30T09:59:58.338Z
+Engine/Config/StagedBuild_AxisAllies.ini	2026-10-05T07:52:56.647Z
 AxisAllies/Content/PythonAI/AITerritoryGraph.json	2026-09-06T03:43:14.872Z
-AxisAllies/Content/PythonAI/axis_allies.onnx	2026-09-30T08:40:31.403Z
-AxisAllies/Content/PythonAI/axis_allies.pt	2026-09-30T08:40:29.119Z
+AxisAllies/Content/PythonAI/axis_allies.onnx	2026-10-05T06:34:59.492Z
+AxisAllies/Content/PythonAI/axis_allies.pt	2026-10-05T06:34:57.258Z
 AxisAllies/Content/PythonAI/axis_allies.uasset	2026-09-25T00:30:44.460Z
 AxisAllies/Content/PythonAI/model.py	2026-09-28T01:49:06.723Z
-AxisAllies/Content/PythonAI/PastModels/benchmark.json	2026-09-30T08:48:27.261Z
+AxisAllies/Content/PythonAI/PastModels/benchmark.json	2026-10-05T07:38:45.628Z
 AxisAllies/Content/PythonAI/PastModels/champion.onnx	2026-09-30T08:40:33.407Z
 AxisAllies/Content/PythonAI/PastModels/champion.pt	2026-09-30T08:40:33.419Z
 AxisAllies/Content/PythonAI/PastModels/champion_info.json	2026-09-30T08:40:33.419Z
@@ -43,4 +43,4 @@ Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_synchronization2.dll	202
 Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_synchronization2.json	2026-04-23T07:29:12.417Z
 Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_validation.dll	2026-04-23T07:29:12.801Z
 Engine/Binaries/ThirdParty/Vulkan/Win64/VkLayer_khronos_validation.json	2026-04-23T07:29:12.804Z
-AxisAllies.exe	2026-09-30T09:59:58.329Z
+AxisAllies.exe	2026-10-05T07:52:56.638Z

@@ -158,7 +158,7 @@ bool UAIManager::EnsureModelsExist()
     UE_LOG(LogTemp, Warning, TEXT("  ONNX path: %s"), *OnnxPath);
     UE_LOG(LogTemp, Warning, TEXT("  BaseDir:   %s"), *BaseDir);
 
-    const FString PythonExe = TEXT("python");
+    const FString PythonExe = GetPythonExePath();
     const FString Script = FPaths::Combine(BaseDir, TEXT("model.py"));
     const FString Args = FString::Printf(TEXT("\"%s\""), *Script);
 
@@ -2695,7 +2695,7 @@ void UAIManager::FinalizeMCTSTrainingPipeline()
             FPlatformProcess::CreatePipe(PipeRead, PipeWrite);
 
             FProcHandle ProcHandle = FPlatformProcess::CreateProc(
-                TEXT("python"),
+                *GetPythonExePath(),
                 *Params,
                 false,  // bLaunchDetached
                 true,   // bLaunchHidden (output goes to the Unreal log)
@@ -3651,7 +3651,7 @@ bool UAIManager::RunEndToEndInferenceSmokeTest()
     // ----------------------------------------------------------------
     // STAGE 5: PYTHON TRAINING PIPELINE
     // ----------------------------------------------------------------
-    const FString PythonExe = TEXT("python");
+    const FString PythonExe = GetPythonExePath();
     const FString ModelScript = FPaths::Combine(
         GetPythonAIDir(),
         TEXT("model.py"));
